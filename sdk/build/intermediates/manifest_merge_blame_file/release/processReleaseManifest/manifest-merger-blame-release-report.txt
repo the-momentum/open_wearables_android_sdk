@@ -1,0 +1,115 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    xmlns:tools="http://schemas.android.com/tools"
+4    package="com.openwearables.health.sdk" >
+5
+6    <uses-sdk android:minSdkVersion="29" />
+7
+8    <!-- Required for background sync -->
+9    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+9-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:5:5-77
+9-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:5:22-74
+10    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+10-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:6:5-87
+10-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:6:22-84
+11    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+11-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:7:5-77
+11-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:7:22-74
+12    <uses-permission android:name="android.permission.INTERNET" />
+12-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:8:5-67
+12-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:8:22-64
+13    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+13-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:9:5-79
+13-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:9:22-76
+14
+15    <!-- Health Connect permissions -->
+16    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND" />
+16-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:12:5-96
+16-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:12:22-93
+17    <uses-permission android:name="android.permission.health.READ_STEPS" />
+17-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:13:5-76
+17-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:13:22-73
+18    <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
+18-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:14:5-81
+18-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:14:22-78
+19    <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE" />
+19-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:15:5-89
+19-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:15:22-86
+20    <uses-permission android:name="android.permission.health.READ_HEART_RATE_VARIABILITY" />
+20-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:16:5-93
+20-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:16:22-90
+21    <uses-permission android:name="android.permission.health.READ_OXYGEN_SATURATION" />
+21-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:17:5-88
+21-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:17:22-85
+22    <uses-permission android:name="android.permission.health.READ_BLOOD_PRESSURE" />
+22-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:18:5-85
+22-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:18:22-82
+23    <uses-permission android:name="android.permission.health.READ_BLOOD_GLUCOSE" />
+23-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:19:5-84
+23-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:19:22-81
+24    <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED" />
+24-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:20:5-93
+24-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:20:22-90
+25    <uses-permission android:name="android.permission.health.READ_BASAL_METABOLIC_RATE" />
+25-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:21:5-91
+25-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:21:22-88
+26    <uses-permission android:name="android.permission.health.READ_BODY_TEMPERATURE" />
+26-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:22:5-87
+26-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:22:22-84
+27    <uses-permission android:name="android.permission.health.READ_WEIGHT" />
+27-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:23:5-77
+27-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:23:22-74
+28    <uses-permission android:name="android.permission.health.READ_HEIGHT" />
+28-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:24:5-77
+28-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:24:22-74
+29    <uses-permission android:name="android.permission.health.READ_BODY_FAT" />
+29-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:25:5-79
+29-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:25:22-76
+30    <uses-permission android:name="android.permission.health.READ_LEAN_BODY_MASS" />
+30-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:26:5-85
+30-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:26:22-82
+31    <uses-permission android:name="android.permission.health.READ_FLOORS_CLIMBED" />
+31-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:27:5-85
+31-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:27:22-82
+32    <uses-permission android:name="android.permission.health.READ_DISTANCE" />
+32-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:28:5-79
+32-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:28:22-76
+33    <uses-permission android:name="android.permission.health.READ_HYDRATION" />
+33-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:29:5-80
+33-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:29:22-77
+34    <uses-permission android:name="android.permission.health.READ_VO2_MAX" />
+34-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:30:5-78
+34-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:30:22-75
+35    <uses-permission android:name="android.permission.health.READ_RESPIRATORY_RATE" />
+35-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:31:5-87
+35-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:31:22-84
+36    <uses-permission android:name="android.permission.health.READ_EXERCISE" />
+36-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:32:5-79
+36-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:32:22-76
+37    <uses-permission android:name="android.permission.health.READ_SLEEP" />
+37-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:33:5-76
+37-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:33:22-73
+38
+39    <!-- Package visibility: allow detecting Health Connect on Android 11+ -->
+40    <queries>
+40-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:36:5-38:15
+41        <package android:name="com.google.android.apps.healthdata" />
+41-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:37:9-70
+41-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:37:18-67
+42    </queries>
+43
+44    <application>
+44-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:40:5-46:19
+45
+46        <!-- WorkManager foreground service needs dataSync type for background health reads -->
+47        <service
+47-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:42:9-45:34
+48            android:name="androidx.work.impl.foreground.SystemForegroundService"
+48-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:43:13-81
+49            android:foregroundServiceType="dataSync"
+49-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:44:13-53
+50            tools:node="merge" />
+50-->/Users/kamilpiekarz/StudioProjects/open-wearables-android-sdk/sdk/src/main/AndroidManifest.xml:45:13-31
+51    </application>
+52
+53</manifest>
