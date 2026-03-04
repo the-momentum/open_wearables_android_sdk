@@ -60,7 +60,7 @@ class SyncManager(
         private const val SYNC_INTERVAL_MINUTES = 5L
         private const val SYNC_STATE_DIR = "health_sync_state"
         private const val SYNC_STATE_FILE = "state.json"
-        const val SDK_VERSION = "0.1.0"
+        const val SDK_VERSION = "0.2.0"
     }
 
     private val syncPrefs: SharedPreferences by lazy {
@@ -243,7 +243,11 @@ class SyncManager(
     }
 
     private suspend fun processType(type: String, fullExport: Boolean, endpoint: String): Boolean {
-        val anchors = if (fullExport) emptyMap() else loadAnchors()
+        if (fullExport) {
+            return processTypeNewestFirst(type, olderThan = null, endpoint = endpoint)
+        }
+
+        val anchors = loadAnchors()
         val anchor = anchors[type]
 
         logger("  $type: querying...")
@@ -269,6 +273,48 @@ class SyncManager(
             logger("  $type: $count items -> failed ($reason)")
             return false
         }
+    }
+
+    /**
+     * Full-export: fetch data newest-first in chunks, matching the iOS
+     * `processTypeNewestFirst` strategy. Each chunk moves further back in time
+     * using the oldest record's timestamp as the cursor.
+     */
+    private suspend fun processTypeNewestFirst(
+        type: String,
+        olderThan: Long?,
+        endpoint: String
+    ): Boolean {
+        logger("  $type: querying (newest first${olderThan?.let { ", olderThan=${java.time.Instant.ofEpochMilli(it)}" } ?: ""})...")
+
+        val result = healthProvider.readDataDescending(type, olderThan, CHUNK_SIZE)
+
+        if (result.data.isEmpty) {
+            logger("  $type: all data sent (newest first)")
+            updateTypeProgress(type, 0, isComplete = true, anchorTimestamp = null)
+            return true
+        }
+
+        val count = result.data.totalCount
+        val payload = buildPayload(result.data)
+        val sendResult = sendPayload(endpoint, payload)
+
+        if (!sendResult.success) {
+            val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
+            logger("  $type: $count items -> failed ($reason)")
+            return false
+        }
+
+        // Only save the anchor from the first chunk (the newest data's max timestamp)
+        val anchorTs = if (olderThan == null) result.maxTimestamp else null
+        val isLastChunk = count < CHUNK_SIZE
+
+        logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+        updateTypeProgress(type, count, isComplete = isLastChunk, anchorTimestamp = anchorTs)
+
+        if (isLastChunk) return true
+
+        return processTypeNewestFirst(type, result.minTimestamp, endpoint)
     }
 
     // MARK: - Payload (unified)
