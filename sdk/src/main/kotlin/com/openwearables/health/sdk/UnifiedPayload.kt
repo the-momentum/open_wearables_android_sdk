@@ -157,7 +157,8 @@ data class UnifiedHealthData(
 
 data class ProviderReadResult(
     val data: UnifiedHealthData,
-    val maxTimestamp: Long?
+    val maxTimestamp: Long?,
+    val minTimestamp: Long? = null
 )
 
 // ---------------------------------------------------------------------------

@@ -54,4 +54,21 @@ interface HealthDataProvider {
         sinceTimestamp: Long? = null,
         limit: Int = 1000
     ): ProviderReadResult
+
+    /**
+     * Read data for a single type in descending order (newest first).
+     * Used during full export to sync from newest to oldest.
+     *
+     * @param typeId              Flutter-side type identifier (e.g. `"heartRate"`)
+     * @param olderThanTimestamp  epoch-ms cursor; only data **before** this point is returned.
+     *                            `null` means start from the newest available data.
+     * @param limit               maximum number of raw records to fetch from the store
+     * @return [ProviderReadResult] with [ProviderReadResult.minTimestamp] set to the oldest
+     *         record's timestamp in this chunk (used as cursor for the next chunk).
+     */
+    suspend fun readDataDescending(
+        typeId: String,
+        olderThanTimestamp: Long? = null,
+        limit: Int = 1000
+    ): ProviderReadResult = ProviderReadResult(UnifiedHealthData(), null, null)
 }

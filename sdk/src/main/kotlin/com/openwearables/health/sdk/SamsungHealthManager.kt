@@ -142,6 +142,16 @@ class SamsungHealthManager(
         return convertToUnified(typeId, rawRecords)
     }
 
+    override suspend fun readDataDescending(
+        typeId: String,
+        olderThanTimestamp: Long?,
+        limit: Int
+    ): ProviderReadResult {
+        val rawRecords = readRawDataDescending(typeId, olderThanTimestamp, limit)
+        if (rawRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+        return convertToUnified(typeId, rawRecords)
+    }
+
     // -----------------------------------------------------------------------
     // Raw data reading (Samsung SDK)
     // -----------------------------------------------------------------------
@@ -190,6 +200,48 @@ class SamsungHealthManager(
             records
         } catch (e: Exception) {
             logger("[$typeId] Failed to read: ${e.javaClass.simpleName}: ${e.message}")
+            emptyList()
+        }
+    }
+
+    private suspend fun readRawDataDescending(
+        typeId: String,
+        olderThanTimestamp: Long?,
+        limit: Int
+    ): List<HealthDataRecord> = withContext(Dispatchers.IO) {
+        val aggregateConfig = getAggregateConfig(typeId)
+        if (aggregateConfig != null) {
+            return@withContext readAggregateDataDescending(typeId, aggregateConfig, olderThanTimestamp, limit)
+        }
+
+        val dataType = mapToDataType(typeId)
+        if (dataType == null) {
+            logger("[$typeId] mapToDataType returned null — unknown type")
+            return@withContext emptyList()
+        }
+        if (healthDataStore == null) withContext(Dispatchers.Main) { connect() }
+        val store = healthDataStore
+        if (store == null) {
+            logger("[$typeId] healthDataStore is null after connect attempt")
+            return@withContext emptyList()
+        }
+
+        try {
+            logger("[$typeId] Building descending read request (olderThan=$olderThanTimestamp, limit=$limit)")
+            val request = buildReadRequestDescending(dataType, olderThanTimestamp, limit)
+            if (request == null) {
+                logger("[$typeId] buildReadRequestDescending returned null")
+                return@withContext emptyList()
+            }
+            val response = store.readData(request)
+            logger("[$typeId] Raw SDK response (desc): ${response.dataList.size} data points")
+            val records = response.dataList.mapNotNull { dp ->
+                parseDataPoint(typeId, dp as HealthDataPoint)
+            }
+            logger("[$typeId] After parsing (desc): ${records.size} records")
+            records
+        } catch (e: Exception) {
+            logger("[$typeId] Failed to read (desc): ${e.javaClass.simpleName}: ${e.message}")
             emptyList()
         }
     }
@@ -293,6 +345,74 @@ class SamsungHealthManager(
             return dataList.mapNotNull { item -> parseAggregateItem(typeId, config.fieldName, item as Any) }
         } catch (e: Exception) {
             logger("[$typeId] Aggregate read failed: ${e.javaClass.simpleName}: ${e.message}")
+            return emptyList()
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun readAggregateDataDescending(
+        typeId: String,
+        config: AggregateConfig,
+        olderThanTimestamp: Long?,
+        limit: Int
+    ): List<HealthDataRecord> {
+        if (healthDataStore == null) withContext(Dispatchers.Main) { connect() }
+        val store = healthDataStore
+        if (store == null) {
+            logger("[$typeId] healthDataStore is null")
+            return emptyList()
+        }
+
+        try {
+            val aggregateOp = findAggregateOp(typeId, config.dataType, config.aggregateOpName) ?: return emptyList()
+
+            val builderGetter = aggregateOp.javaClass.methods.find {
+                it.name == "getRequestBuilder" || it.name == "requestBuilder"
+            } ?: return emptyList()
+            val builder = builderGetter.invoke(aggregateOp) ?: return emptyList()
+            val builderClass = builder.javaClass
+
+            val endTime = if (olderThanTimestamp != null) {
+                LocalDateTime.ofInstant(Instant.ofEpochMilli(olderThanTimestamp), ZoneId.systemDefault())
+            } else {
+                LocalDateTime.now()
+            }
+            val startTime = LocalDateTime.now().minusDays(30)
+            val timeFilter = LocalTimeFilter.of(startTime, endTime)
+
+            var hasGrouping = false
+            try {
+                val groupClass = Class.forName("com.samsung.android.sdk.health.data.request.LocalTimeGroup")
+                val groupUnitClass = Class.forName("com.samsung.android.sdk.health.data.request.LocalTimeGroupUnit")
+                val hourlyUnit = groupUnitClass.enumConstants?.find { (it as Enum<*>).name == "HOURLY" }
+                if (hourlyUnit != null) {
+                    val groupOfMethod = groupClass.getMethod("of", groupUnitClass, Int::class.java)
+                    val timeGroup = groupOfMethod.invoke(null, hourlyUnit, 1)
+                    builderClass.getMethod("setLocalTimeFilterWithGroup", LocalTimeFilter::class.java, groupClass)
+                        .invoke(builder, timeFilter, timeGroup)
+                    hasGrouping = true
+                }
+            } catch (_: Exception) {}
+
+            if (!hasGrouping) {
+                try {
+                    builderClass.getMethod("setLocalTimeFilter", LocalTimeFilter::class.java)
+                        .invoke(builder, timeFilter)
+                } catch (_: Exception) {}
+            }
+
+            try {
+                builderClass.getMethod("setOrdering", Ordering::class.java).invoke(builder, Ordering.DESC)
+            } catch (_: Exception) {}
+
+            val request = builderClass.getMethod("build").invoke(builder) as AggregateRequest<Any>
+            val response = store.aggregateData(request)
+            val dataList = response.dataList
+            logger("[$typeId] Aggregate response (desc): ${dataList.size} items")
+
+            return dataList.mapNotNull { item -> parseAggregateItem(typeId, config.fieldName, item as Any) }
+        } catch (e: Exception) {
+            logger("[$typeId] Aggregate read (desc) failed: ${e.javaClass.simpleName}: ${e.message}")
             return emptyList()
         }
     }
@@ -409,10 +529,12 @@ class SamsungHealthManager(
         val workouts = mutableListOf<UnifiedWorkout>()
         val sleepEntries = mutableListOf<UnifiedSleep>()
         var maxTimestamp: Long? = null
+        var minTimestamp: Long? = null
 
         for (raw in rawRecords) {
             val ts = raw.endTime ?: raw.startTime
             if (maxTimestamp == null || ts > maxTimestamp) maxTimestamp = ts
+            if (minTimestamp == null || ts < minTimestamp) minTimestamp = ts
 
             when (typeId) {
                 "workout" -> convertWorkout(raw)?.let { workouts.addAll(it) }
@@ -423,7 +545,8 @@ class SamsungHealthManager(
 
         return ProviderReadResult(
             data = UnifiedHealthData(records, workouts, sleepEntries),
-            maxTimestamp = maxTimestamp
+            maxTimestamp = maxTimestamp,
+            minTimestamp = minTimestamp
         )
     }
 
@@ -805,6 +928,32 @@ class SamsungHealthManager(
             result
         } catch (e: Exception) {
             logger("[buildReadRequest] build FAILED: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun buildReadRequestDescending(dataType: DataType, olderThanTimestamp: Long?, limit: Int): ReadDataRequest<HealthDataPoint>? {
+        val builder = getRequestBuilder(dataType, limit) ?: return null
+        val builderClass = builder.javaClass
+
+        try { builderClass.getMethod("setLimit", Int::class.java).invoke(builder, limit) } catch (_: Exception) {}
+        try { builderClass.getMethod("setOrdering", Ordering::class.java).invoke(builder, Ordering.DESC) } catch (_: Exception) {}
+
+        if (olderThanTimestamp != null) {
+            try {
+                val endTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(olderThanTimestamp), ZoneId.systemDefault())
+                val farPast = LocalDateTime.of(2000, 1, 1, 0, 0)
+                val filter = LocalTimeFilter.of(farPast, endTime)
+                builderClass.getMethod("setLocalTimeFilter", LocalTimeFilter::class.java).invoke(builder, filter)
+                logger("[buildReadRequestDescending] Applied time filter before=$endTime")
+            } catch (e: Exception) { logger("[buildReadRequestDescending] setLocalTimeFilter failed: ${e.message}") }
+        }
+
+        return try {
+            builderClass.getMethod("build").invoke(builder) as? ReadDataRequest<HealthDataPoint>
+        } catch (e: Exception) {
+            logger("[buildReadRequestDescending] build FAILED: ${e.javaClass.simpleName}: ${e.message}")
             null
         }
     }
