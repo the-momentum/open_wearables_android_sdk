@@ -27,7 +27,11 @@ interface HealthDataProvider {
     /** Release any held resources. */
     fun disconnect()
 
-    /** Provide the current Activity (needed for permission dialogs). */
+    /**
+     * Provide the current Activity (needed for permission dialogs).
+     * Implementations should store this as a [java.lang.ref.WeakReference]
+     * to prevent Activity leaks in singleton-scoped objects.
+     */
     fun setActivity(activity: Activity?)
 
     /** Configure which Flutter-side type IDs should be tracked. */

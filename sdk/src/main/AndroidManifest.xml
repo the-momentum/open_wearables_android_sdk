@@ -8,7 +8,15 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- Health Connect permissions -->
+    <!--
+        Health Connect permissions.
+
+        NOTE: READ_HEALTH_DATA_IN_BACKGROUND is a restricted permission.
+        Apps using this SDK must submit a declaration form in the Google Play
+        Console explaining why background health data access is necessary.
+        If denied, the SDK will still work but only read data while the app
+        is in the foreground. Handle the permission-denied case gracefully.
+    -->
     <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND" />
     <uses-permission android:name="android.permission.health.READ_STEPS" />
     <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
@@ -32,9 +40,10 @@
     <uses-permission android:name="android.permission.health.READ_EXERCISE" />
     <uses-permission android:name="android.permission.health.READ_SLEEP" />
 
-    <!-- Package visibility: allow detecting Health Connect on Android 11+ -->
+    <!-- Package visibility: allow detecting Health Connect and Samsung Health on Android 11+ -->
     <queries>
         <package android:name="com.google.android.apps.healthdata" />
+        <package android:name="com.samsung.android.app.shealth" />
     </queries>
 
     <application>

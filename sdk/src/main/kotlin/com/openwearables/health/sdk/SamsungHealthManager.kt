@@ -19,8 +19,8 @@ import com.samsung.android.sdk.health.data.request.LocalTimeFilter
 import com.samsung.android.sdk.health.data.request.Ordering
 import com.samsung.android.sdk.health.data.request.AggregateRequest
 import com.samsung.android.sdk.health.data.request.ReadDataRequest
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -28,17 +28,19 @@ import java.util.*
 
 class SamsungHealthManager(
     private val context: Context,
-    private var activity: Activity?,
+    activity: Activity?,
+    private val dispatchers: DispatcherProvider,
     private val logger: (String) -> Unit
 ) : HealthDataProvider {
 
-    override val providerId = "samsung"
-    override val providerName = "Samsung Health"
+    override val providerId = ProviderIds.SAMSUNG
+    override val providerName = ProviderDisplayNames.SAMSUNG_HEALTH
 
     private var healthDataStore: HealthDataStore? = null
     private var deviceManager: DeviceManager? = null
     private var trackedTypeIds: Set<String> = emptySet()
     private var deviceCache: MutableMap<String, Device> = mutableMapOf()
+    private var activityRef: WeakReference<Activity>? = activity?.let { WeakReference(it) }
 
     companion object {
         private const val SAMSUNG_HEALTH_PACKAGE = "com.sec.android.app.shealth"
@@ -50,7 +52,7 @@ class SamsungHealthManager(
     // -----------------------------------------------------------------------
 
     override fun setActivity(activity: Activity?) {
-        this.activity = activity
+        this.activityRef = activity?.let { WeakReference(it) }
     }
 
     override fun setTrackedTypes(typeIds: List<String>) {
@@ -72,11 +74,35 @@ class SamsungHealthManager(
         } catch (e: PackageManager.NameNotFoundException) {
             false
         } catch (e: Exception) {
+            logger("Samsung Health availability check failed: ${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }
 
-    override suspend fun connect(): Boolean = withContext(Dispatchers.Main) {
+    /**
+     * Returns detailed availability info with error reporting via [Outcome].
+     */
+    fun isAvailableDetailed(): Outcome<Boolean> {
+        return try {
+            val packageInfo = context.packageManager.getPackageInfo(SAMSUNG_HEALTH_PACKAGE, 0)
+            @Suppress("DEPRECATION")
+            val versionCode = packageInfo.versionCode
+            if (versionCode >= MIN_SAMSUNG_HEALTH_VERSION) {
+                Outcome.Success(true)
+            } else {
+                Outcome.Error(
+                    IllegalStateException("Samsung Health version $versionCode < $MIN_SAMSUNG_HEALTH_VERSION"),
+                    "Samsung Health version too old"
+                )
+            }
+        } catch (e: PackageManager.NameNotFoundException) {
+            Outcome.Success(false)
+        } catch (e: Exception) {
+            Outcome.Error(e, "Failed to check Samsung Health availability")
+        }
+    }
+
+    override suspend fun connect(): Boolean = withContext(dispatchers.io) {
         if (!isAvailable()) {
             logger("Samsung Health not available on this device")
             return@withContext false
@@ -109,12 +135,12 @@ class SamsungHealthManager(
         if (healthDataStore == null && !connect()) return false
 
         val store = healthDataStore ?: return false
-        val act = activity ?: run {
+        val act = activityRef?.get() ?: run {
             logger("Activity not available for permission request")
             return false
         }
 
-        return withContext(Dispatchers.Main) {
+        return withContext(dispatchers.main) {
             try {
                 val permissions = dataTypes.map { Permission.of(it, AccessType.READ) }.toSet()
                 logger("Requesting ${permissions.size} Samsung Health permissions...")
@@ -160,7 +186,7 @@ class SamsungHealthManager(
         typeId: String,
         sinceTimestamp: Long?,
         limit: Int
-    ): List<HealthDataRecord> = withContext(Dispatchers.IO) {
+    ): List<HealthDataRecord> = withContext(dispatchers.io) {
         val aggregateConfig = getAggregateConfig(typeId)
         if (aggregateConfig != null) {
             return@withContext readAggregateData(typeId, aggregateConfig, sinceTimestamp, limit)
@@ -171,7 +197,7 @@ class SamsungHealthManager(
             logger("[$typeId] mapToDataType returned null — unknown type")
             return@withContext emptyList()
         }
-        if (healthDataStore == null) withContext(Dispatchers.Main) { connect() }
+        if (healthDataStore == null) withContext(dispatchers.io) { connect() }
         val store = healthDataStore
         if (store == null) {
             logger("[$typeId] healthDataStore is null after connect attempt")
@@ -191,8 +217,6 @@ class SamsungHealthManager(
                 val parsed = parseDataPoint(typeId, dp as HealthDataPoint)
                 if (parsed == null) {
                     logger("[$typeId] parseDataPoint returned null for uid=${dp.uid}")
-                } else {
-                    logger("[$typeId] Parsed record uid=${parsed.uid}, fields=${parsed.fields}")
                 }
                 parsed
             }
@@ -208,7 +232,7 @@ class SamsungHealthManager(
         typeId: String,
         olderThanTimestamp: Long?,
         limit: Int
-    ): List<HealthDataRecord> = withContext(Dispatchers.IO) {
+    ): List<HealthDataRecord> = withContext(dispatchers.io) {
         val aggregateConfig = getAggregateConfig(typeId)
         if (aggregateConfig != null) {
             return@withContext readAggregateDataDescending(typeId, aggregateConfig, olderThanTimestamp, limit)
@@ -219,7 +243,7 @@ class SamsungHealthManager(
             logger("[$typeId] mapToDataType returned null — unknown type")
             return@withContext emptyList()
         }
-        if (healthDataStore == null) withContext(Dispatchers.Main) { connect() }
+        if (healthDataStore == null) withContext(dispatchers.io) { connect() }
         val store = healthDataStore
         if (store == null) {
             logger("[$typeId] healthDataStore is null after connect attempt")
@@ -265,7 +289,7 @@ class SamsungHealthManager(
         sinceTimestamp: Long?,
         limit: Int
     ): List<HealthDataRecord> {
-        if (healthDataStore == null) withContext(Dispatchers.Main) { connect() }
+        if (healthDataStore == null) withContext(dispatchers.io) { connect() }
         val store = healthDataStore
         if (store == null) {
             logger("[$typeId] healthDataStore is null")
@@ -295,7 +319,6 @@ class SamsungHealthManager(
             val builderClass = builder.javaClass
             logger("[$typeId] Got builder: ${builderClass.name}")
 
-            // Time filter
             val startTime = if (sinceTimestamp != null) {
                 LocalDateTime.ofInstant(Instant.ofEpochMilli(sinceTimestamp + 1), ZoneId.systemDefault())
             } else {
@@ -356,7 +379,7 @@ class SamsungHealthManager(
         olderThanTimestamp: Long?,
         limit: Int
     ): List<HealthDataRecord> {
-        if (healthDataStore == null) withContext(Dispatchers.Main) { connect() }
+        if (healthDataStore == null) withContext(dispatchers.io) { connect() }
         val store = healthDataStore
         if (store == null) {
             logger("[$typeId] healthDataStore is null")
@@ -418,7 +441,6 @@ class SamsungHealthManager(
     }
 
     private fun findAggregateOp(typeId: String, dataType: DataType, opName: String): Any? {
-        // Try 1: Companion getter (e.g. Companion.getTOTAL())
         try {
             val companionField = dataType.javaClass.getField("Companion")
             val companion = companionField.get(dataType)
@@ -434,7 +456,6 @@ class SamsungHealthManager(
             logger("[$typeId] Companion.$opName failed: ${e.message}")
         }
 
-        // Try 2: static field
         try {
             val field = dataType.javaClass.getField(opName)
             val op = field.get(dataType)
@@ -446,7 +467,6 @@ class SamsungHealthManager(
             logger("[$typeId] Static field $opName failed: ${e.message}")
         }
 
-        // Try 3: getAllAggregateOperations — match by name or pick first
         try {
             val allOps = dataType.javaClass.getMethod("getAllAggregateOperations").invoke(dataType)
             if (allOps is Collection<*> && allOps.isNotEmpty()) {
@@ -866,7 +886,7 @@ class SamsungHealthManager(
     )
 
     // -----------------------------------------------------------------------
-    // Samsung SDK internals (unchanged logic)
+    // Samsung SDK internals
     // -----------------------------------------------------------------------
 
     private fun mapToDataType(typeId: String): DataType? {
@@ -1116,107 +1136,121 @@ class SamsungHealthManager(
         else -> emptyMap()
     }
 
-    // ---- field extractors ----
+    // ---- field extractors (using direct SDK field access where possible) ----
 
     private fun extractHeartRateFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.HEART_RATE, "HEART_RATE", dp)?.let { f["HEART_RATE"] = it }
-        getFieldValue<Any>(DataTypes.HEART_RATE, "HEART_RATE_STATUS", dp)?.let { f["HEART_RATE_STATUS"] = if (it is Enum<*>) it.name else it.toString() }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Float>(DataTypes.HEART_RATE, "HEART_RATE", dp)?.let { fields["HEART_RATE"] = it }
+        getFieldValue<Any>(DataTypes.HEART_RATE, "HEART_RATE_STATUS", dp)?.let { fields["HEART_RATE_STATUS"] = if (it is Enum<*>) it.name else it.toString() }
+        return fields
     }
 
     private fun extractStepsFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
+        val fields = mutableMapOf<String, Any?>()
         val totalLong = getFieldValue<Long>(DataTypes.STEPS, "TOTAL", dp)
-        val totalInt = getFieldValue<Int>(DataTypes.STEPS, "TOTAL", dp)
-        val totalFloat = getFieldValue<Float>(DataTypes.STEPS, "TOTAL", dp)
         val totalAny = getFieldValue<Any>(DataTypes.STEPS, "TOTAL", dp)
-        logger("[steps] extractStepsFields: TOTAL as Long=$totalLong, Int=$totalInt, Float=$totalFloat, Any=$totalAny (type=${totalAny?.javaClass?.simpleName})")
+        logger("[steps] extractStepsFields: TOTAL as Long=$totalLong, Any=$totalAny (type=${totalAny?.javaClass?.simpleName})")
         if (totalLong != null) {
-            f["TOTAL"] = totalLong
+            fields["TOTAL"] = totalLong
         } else if (totalAny is Number) {
             logger("[steps] TOTAL fallback via Number: ${totalAny.toLong()}")
-            f["TOTAL"] = totalAny.toLong()
+            fields["TOTAL"] = totalAny.toLong()
         }
-        return f
+        return fields
     }
 
     private fun extractBloodOxygenFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.BLOOD_OXYGEN, "OXYGEN_SATURATION", dp)?.let { f["OXYGEN_SATURATION"] = it }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Float>(DataTypes.BLOOD_OXYGEN, "OXYGEN_SATURATION", dp)?.let { fields["OXYGEN_SATURATION"] = it }
+        return fields
     }
 
     private fun extractBloodGlucoseFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.BLOOD_GLUCOSE, "LEVEL", dp)?.let { f["LEVEL"] = it }
-        getFieldValue<Any>(DataTypes.BLOOD_GLUCOSE, "MEAL_STATUS", dp)?.let { f["MEAL_STATUS"] = if (it is Enum<*>) it.name else it.toString() }
-        getFieldValue<Any>(DataTypes.BLOOD_GLUCOSE, "MEASUREMENT_TYPE", dp)?.let { f["MEASUREMENT_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
-        getFieldValue<Any>(DataTypes.BLOOD_GLUCOSE, "SAMPLE_SOURCE_TYPE", dp)?.let { f["SAMPLE_SOURCE_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Float>(DataTypes.BLOOD_GLUCOSE, "LEVEL", dp)?.let { fields["LEVEL"] = it }
+        getFieldValue<Any>(DataTypes.BLOOD_GLUCOSE, "MEAL_STATUS", dp)?.let { fields["MEAL_STATUS"] = if (it is Enum<*>) it.name else it.toString() }
+        getFieldValue<Any>(DataTypes.BLOOD_GLUCOSE, "MEASUREMENT_TYPE", dp)?.let { fields["MEASUREMENT_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
+        getFieldValue<Any>(DataTypes.BLOOD_GLUCOSE, "SAMPLE_SOURCE_TYPE", dp)?.let { fields["SAMPLE_SOURCE_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
+        return fields
     }
 
     private fun extractBloodPressureFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.BLOOD_PRESSURE, "SYSTOLIC", dp)?.let { f["SYSTOLIC"] = it }
-        getFieldValue<Float>(DataTypes.BLOOD_PRESSURE, "DIASTOLIC", dp)?.let { f["DIASTOLIC"] = it }
-        getFieldValue<Float>(DataTypes.BLOOD_PRESSURE, "PULSE", dp)?.let { f["PULSE"] = it }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Float>(DataTypes.BLOOD_PRESSURE, "SYSTOLIC", dp)?.let { fields["SYSTOLIC"] = it }
+        getFieldValue<Float>(DataTypes.BLOOD_PRESSURE, "DIASTOLIC", dp)?.let { fields["DIASTOLIC"] = it }
+        getFieldValue<Float>(DataTypes.BLOOD_PRESSURE, "PULSE", dp)?.let { fields["PULSE"] = it }
+        return fields
     }
 
     private fun extractBodyTemperatureFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.BODY_TEMPERATURE, "TEMPERATURE", dp)?.let { f["TEMPERATURE"] = it }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Float>(DataTypes.BODY_TEMPERATURE, "TEMPERATURE", dp)?.let { fields["TEMPERATURE"] = it }
+        return fields
     }
 
     private fun extractFloorsClimbedFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Int>(DataTypes.FLOORS_CLIMBED, "FLOORS", dp)?.let { f["FLOORS"] = it }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Int>(DataTypes.FLOORS_CLIMBED, "FLOORS", dp)?.let { fields["FLOORS"] = it }
+        return fields
     }
 
     private fun extractBodyCompositionFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "WEIGHT", dp)?.let { f["WEIGHT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "HEIGHT", dp)?.let { f["HEIGHT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT", dp)?.let { f["BODY_FAT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT_MASS", dp)?.let { f["BODY_FAT_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "FAT_FREE_MASS", dp)?.let { f["FAT_FREE_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "SKELETAL_MUSCLE_MASS", dp)?.let { f["SKELETAL_MUSCLE_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BMI", dp)?.let { f["BMI"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BASAL_METABOLIC_RATE", dp)?.let { f["BASAL_METABOLIC_RATE"] = it }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "WEIGHT", dp)?.let { fields["WEIGHT"] = it }
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "HEIGHT", dp)?.let { fields["HEIGHT"] = it }
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT", dp)?.let { fields["BODY_FAT"] = it }
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT_MASS", dp)?.let { fields["BODY_FAT_MASS"] = it }
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "FAT_FREE_MASS", dp)?.let { fields["FAT_FREE_MASS"] = it }
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "SKELETAL_MUSCLE_MASS", dp)?.let { fields["SKELETAL_MUSCLE_MASS"] = it }
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BMI", dp)?.let { fields["BMI"] = it }
+        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BASAL_METABOLIC_RATE", dp)?.let { fields["BASAL_METABOLIC_RATE"] = it }
+        return fields
     }
 
     private fun extractWaterIntakeFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.WATER_INTAKE, "VOLUME", dp)?.let { f["VOLUME"] = it }
-        return f
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Float>(DataTypes.WATER_INTAKE, "VOLUME", dp)?.let { fields["VOLUME"] = it }
+        return fields
     }
 
     @Suppress("UNCHECKED_CAST")
     private fun extractExerciseFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Any>(DataTypes.EXERCISE, "EXERCISE_TYPE", dp)?.let { f["EXERCISE_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
-        getFieldValue<Float>(DataTypes.EXERCISE, "TOTAL_CALORIES", dp)?.let { f["TOTAL_CALORIES"] = it }
-        getFieldValue<Long>(DataTypes.EXERCISE, "TOTAL_DURATION", dp)?.let { f["TOTAL_DURATION"] = it }
-        getFieldValue<String>(DataTypes.EXERCISE, "CUSTOM_TITLE", dp)?.let { f["CUSTOM_TITLE"] = it }
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Any>(DataTypes.EXERCISE, "EXERCISE_TYPE", dp)?.let { fields["EXERCISE_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
+        getFieldValue<Float>(DataTypes.EXERCISE, "TOTAL_CALORIES", dp)?.let { fields["TOTAL_CALORIES"] = it }
+        getFieldValue<Long>(DataTypes.EXERCISE, "TOTAL_DURATION", dp)?.let { fields["TOTAL_DURATION"] = it }
+        getFieldValue<String>(DataTypes.EXERCISE, "CUSTOM_TITLE", dp)?.let { fields["CUSTOM_TITLE"] = it }
         getFieldValue<List<*>>(DataTypes.EXERCISE, "SESSIONS", dp)?.let { sessions ->
-            f["SESSIONS"] = sessions.mapNotNull { extractSession(it) }
+            fields["SESSIONS"] = sessions.mapNotNull { extractObjectFields(it) }
         }
-        return f
+        return fields
     }
 
-    private fun extractSession(session: Any?): Map<String, Any?>? {
-        if (session == null) return null
+    @Suppress("UNCHECKED_CAST")
+    private fun extractSleepFields(dp: HealthDataPoint): Map<String, Any?> {
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<Any>(DataTypes.SLEEP, "STAGE", dp)?.let { fields["STAGE"] = if (it is Enum<*>) it.name else it.toString() }
+        getFieldValue<Float>(DataTypes.SLEEP, "EFFICIENCY", dp)?.let { fields["EFFICIENCY"] = it }
+        getFieldValue<Int>(DataTypes.SLEEP, "SLEEP_SCORE", dp)?.let { fields["SLEEP_SCORE"] = it }
+        getFieldValue<List<*>>(DataTypes.SLEEP, "SESSIONS", dp)?.let { sessions ->
+            fields["SESSIONS"] = sessions.mapNotNull { extractSleepSessionFields(it) }
+        }
+        return fields
+    }
+
+    /**
+     * Generic getter-based extraction for Samsung SDK objects.
+     * Consolidates the previously duplicated extractSession/extractSleepSession/extractSleepStage methods.
+     */
+    private fun extractObjectFields(obj: Any?): Map<String, Any?>? {
+        if (obj == null) return null
         val data = mutableMapOf<String, Any?>()
         try {
-            session.javaClass.methods
+            obj.javaClass.methods
                 .filter { it.parameterCount == 0 && it.name.startsWith("get") && it.name != "getClass" }
                 .forEach { method ->
                     try {
-                        val value = method.invoke(session) ?: return@forEach
+                        val value = method.invoke(obj) ?: return@forEach
                         val key = method.name.removePrefix("get").let { it.first().lowercase() + it.drop(1) }
                         when (value) {
                             is Number -> data[key] = value
@@ -1232,19 +1266,7 @@ class SamsungHealthManager(
         return data.ifEmpty { null }
     }
 
-    @Suppress("UNCHECKED_CAST")
-    private fun extractSleepFields(dp: HealthDataPoint): Map<String, Any?> {
-        val f = mutableMapOf<String, Any?>()
-        getFieldValue<Any>(DataTypes.SLEEP, "STAGE", dp)?.let { f["STAGE"] = if (it is Enum<*>) it.name else it.toString() }
-        getFieldValue<Float>(DataTypes.SLEEP, "EFFICIENCY", dp)?.let { f["EFFICIENCY"] = it }
-        getFieldValue<Int>(DataTypes.SLEEP, "SLEEP_SCORE", dp)?.let { f["SLEEP_SCORE"] = it }
-        getFieldValue<List<*>>(DataTypes.SLEEP, "SESSIONS", dp)?.let { sessions ->
-            f["SESSIONS"] = sessions.mapNotNull { extractSleepSession(it) }
-        }
-        return f
-    }
-
-    private fun extractSleepSession(session: Any?): Map<String, Any?>? {
+    private fun extractSleepSessionFields(session: Any?): Map<String, Any?>? {
         if (session == null) return null
         val data = mutableMapOf<String, Any?>()
         try {
@@ -1262,31 +1284,9 @@ class SamsungHealthManager(
                             is java.time.Instant -> data[key] = value.toEpochMilli()
                             is java.time.Duration -> data[key] = value.toMillis()
                             is List<*> -> {
-                                val stages = value.mapNotNull { extractSleepStage(it) }
+                                val stages = value.mapNotNull { extractObjectFields(it) }
                                 if (stages.isNotEmpty()) data[key] = stages
                             }
-                        }
-                    } catch (_: Exception) {}
-                }
-        } catch (_: Exception) {}
-        return data.ifEmpty { null }
-    }
-
-    private fun extractSleepStage(stage: Any?): Map<String, Any?>? {
-        if (stage == null) return null
-        val data = mutableMapOf<String, Any?>()
-        try {
-            stage.javaClass.methods
-                .filter { it.parameterCount == 0 && it.name.startsWith("get") && it.name != "getClass" }
-                .forEach { method ->
-                    try {
-                        val value = method.invoke(stage) ?: return@forEach
-                        val key = method.name.removePrefix("get").let { it.first().lowercase() + it.drop(1) }
-                        when (value) {
-                            is Number -> data[key] = value
-                            is Enum<*> -> data[key] = value.name
-                            is java.time.Instant -> data[key] = value.toEpochMilli()
-                            is java.time.Duration -> data[key] = value.toMillis()
                         }
                     } catch (_: Exception) {}
                 }
@@ -1303,33 +1303,3 @@ class SamsungHealthManager(
         } catch (_: Exception) { null }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Internal raw data models (Samsung-specific, not exposed via interface)
-// ---------------------------------------------------------------------------
-
-data class HealthDataRecord(
-    val uid: String,
-    val dataType: String,
-    val startTime: Long,
-    val endTime: Long?,
-    val dataSource: RawDataSource,
-    val device: DeviceInfo,
-    val fields: Map<String, Any?>
-)
-
-data class RawDataSource(val appId: String?, val deviceId: String?)
-
-data class DeviceInfo(
-    val deviceId: String?,
-    val manufacturer: String,
-    val model: String,
-    val name: String,
-    val brand: String,
-    val product: String,
-    val osType: String,
-    val osVersion: String,
-    val sdkVersion: Int,
-    val deviceType: String?,
-    val isSourceDevice: Boolean = false
-)

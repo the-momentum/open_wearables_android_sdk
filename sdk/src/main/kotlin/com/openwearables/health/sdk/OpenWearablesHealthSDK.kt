@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.*
+import java.lang.ref.WeakReference
 
 /**
  * Main entry point for the Open Wearables Health SDK.
@@ -20,7 +21,12 @@ import kotlinx.coroutines.*
  * sdk.startBackgroundSync()
  * ```
  */
-class OpenWearablesHealthSDK private constructor(private val context: Context) {
+class OpenWearablesHealthSDK private constructor(
+    private val context: Context,
+    private val dispatchers: DispatcherProvider = DefaultDispatcherProvider(),
+    samsungHealthManagerFactory: ((Context, Activity?, DispatcherProvider, (String) -> Unit) -> SamsungHealthManager)? = null,
+    healthConnectManagerFactory: ((Context, Activity?, DispatcherProvider, (String) -> Unit) -> HealthConnectManager)? = null
+) {
 
     companion object {
         private const val TAG = "OpenWearablesHealthSDK"
@@ -28,9 +34,28 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
         @Volatile
         private var instance: OpenWearablesHealthSDK? = null
 
-        fun initialize(context: Context): OpenWearablesHealthSDK {
+        fun initialize(
+            context: Context,
+            dispatchers: DispatcherProvider = DefaultDispatcherProvider()
+        ): OpenWearablesHealthSDK {
             return instance ?: synchronized(this) {
-                instance ?: OpenWearablesHealthSDK(context.applicationContext).also { instance = it }
+                instance ?: OpenWearablesHealthSDK(context.applicationContext, dispatchers).also { instance = it }
+            }
+        }
+
+        /**
+         * Initialize with custom factories for testability. Allows injecting mock managers.
+         */
+        internal fun initializeForTesting(
+            context: Context,
+            dispatchers: DispatcherProvider,
+            samsungFactory: ((Context, Activity?, DispatcherProvider, (String) -> Unit) -> SamsungHealthManager)? = null,
+            healthConnectFactory: ((Context, Activity?, DispatcherProvider, (String) -> Unit) -> HealthConnectManager)? = null
+        ): OpenWearablesHealthSDK {
+            return synchronized(this) {
+                OpenWearablesHealthSDK(context.applicationContext, dispatchers, samsungFactory, healthConnectFactory).also {
+                    instance = it
+                }
             }
         }
 
@@ -49,10 +74,12 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
     internal val secureStorage: SecureStorage by lazy { SecureStorage(context) }
 
     private val samsungHealthManager: SamsungHealthManager by lazy {
-        SamsungHealthManager(context, activity, ::logMessage)
+        samsungHealthManagerFactory?.invoke(context, activityRef?.get(), dispatchers, ::logMessage)
+            ?: SamsungHealthManager(context, activityRef?.get(), dispatchers, ::logMessage)
     }
     private val healthConnectManager: HealthConnectManager by lazy {
-        HealthConnectManager(context, activity, ::logMessage)
+        healthConnectManagerFactory?.invoke(context, activityRef?.get(), dispatchers, ::logMessage)
+            ?: HealthConnectManager(context, activityRef?.get(), dispatchers, ::logMessage)
     }
 
     private var activeProvider: HealthDataProvider? = null
@@ -62,18 +89,18 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
     private var host: String? = null
     private var customSyncUrl: String? = null
 
-    // Activity reference for permission dialogs
-    private var activity: Activity? = null
+    // Activity reference via WeakReference to prevent memory leaks
+    private var activityRef: WeakReference<Activity>? = null
 
-    // Coroutine scope
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    // Coroutine scope — recreated if destroy() was called
+    private var scope = CoroutineScope(dispatchers.main + SupervisorJob())
 
     // -----------------------------------------------------------------------
     // Activity
     // -----------------------------------------------------------------------
 
     fun setActivity(activity: Activity?) {
-        this.activity = activity
+        this.activityRef = activity?.let { WeakReference(it) }
         samsungHealthManager.setActivity(activity)
         healthConnectManager.setActivity(activity)
     }
@@ -114,6 +141,14 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
         }
 
         return isSyncActive
+    }
+
+    /**
+     * Set the background sync interval in minutes. Minimum is 15 (Android limit).
+     */
+    fun setSyncInterval(minutes: Long) {
+        ensureSyncManager().syncIntervalMinutes = minutes
+        logMessage("Sync interval set to ${maxOf(minutes, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)} minutes")
     }
 
     private suspend fun autoRestoreSync() {
@@ -265,8 +300,8 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
 
     fun setProvider(providerId: String): Boolean {
         val provider = when (providerId) {
-            "samsung" -> samsungHealthManager
-            "google" -> healthConnectManager
+            ProviderIds.SAMSUNG -> samsungHealthManager
+            ProviderIds.GOOGLE -> healthConnectManager
             else -> {
                 logMessage("Unknown provider: $providerId")
                 return false
@@ -287,13 +322,13 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
 
     fun getAvailableProviders(): List<Map<String, Any>> = listOf(
         mapOf(
-            "id" to "samsung",
-            "displayName" to "Samsung Health",
+            "id" to ProviderIds.SAMSUNG,
+            "displayName" to ProviderDisplayNames.SAMSUNG_HEALTH,
             "isAvailable" to samsungHealthManager.isAvailable()
         ),
         mapOf(
-            "id" to "google",
-            "displayName" to "Health Connect",
+            "id" to ProviderIds.GOOGLE,
+            "displayName" to ProviderDisplayNames.HEALTH_CONNECT,
             "isAvailable" to healthConnectManager.isAvailable()
         )
     )
@@ -331,6 +366,9 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
     fun destroy() {
         activeProvider?.disconnect()
         scope.cancel()
+        synchronized(Companion) {
+            instance = null
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -347,8 +385,8 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
     }
 
     private fun resolveProvider(providerId: String?): HealthDataProvider = when (providerId) {
-        "google" -> healthConnectManager
-        "samsung" -> samsungHealthManager
+        ProviderIds.GOOGLE -> healthConnectManager
+        ProviderIds.SAMSUNG -> samsungHealthManager
         else -> autoSelectProvider()
     }
 
@@ -360,9 +398,10 @@ class OpenWearablesHealthSDK private constructor(private val context: Context) {
 
     private fun rebuildSyncManager() {
         val provider = activeProvider ?: return
-        syncManager = SyncManager(context, secureStorage, provider, ::logMessage, ::emitAuthError)
+        syncManager = SyncManager(context, secureStorage, provider, dispatchers, ::logMessage, ::emitAuthError)
     }
 
+    @Synchronized
     internal fun ensureSyncManager(): SyncManager {
         if (syncManager == null) {
             getOrCreateProvider()
