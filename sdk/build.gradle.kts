@@ -1,6 +1,7 @@
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.serialization")
     id("kotlin-parcelize")
     id("maven-publish")
 }
@@ -60,15 +61,16 @@ dependencies {
     // Security for EncryptedSharedPreferences
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // Gson for JSON serialization
-    implementation("com.google.code.gson:gson:2.10.1")
+    // Kotlin Serialization for JSON
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
     // OkHttp for network requests
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Testing
     testImplementation("org.jetbrains.kotlin:kotlin-test")
-    testImplementation("org.mockito:mockito-core:5.0.0")
+    testImplementation("io.mockk:mockk:1.13.13")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
 
 afterEvaluate {
@@ -78,7 +80,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.openwearables.health"
                 artifactId = "sdk"
-                version = "0.2.0"
+                version = "0.4.0"
 
                 pom {
                     name.set("Open Wearables Health SDK")

@@ -12,8 +12,8 @@ import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
 import java.time.Instant
 import java.time.ZoneOffset
 import java.util.*
@@ -21,30 +21,40 @@ import kotlin.reflect.KClass
 
 class HealthConnectManager(
     private val context: Context,
-    private var activity: Activity?,
+    activity: Activity?,
+    private val dispatchers: DispatcherProvider,
     private val logger: (String) -> Unit
 ) : HealthDataProvider {
 
-    override val providerId = "google"
-    override val providerName = "Health Connect"
+    override val providerId = ProviderIds.GOOGLE
+    override val providerName = ProviderDisplayNames.HEALTH_CONNECT
 
     private var client: HealthConnectClient? = null
     private var trackedTypeIds: Set<String> = emptySet()
     private var permissionLauncher: ActivityResultLauncher<Set<String>>? = null
     private var pendingPermissionResult: CompletableDeferred<Set<String>>? = null
     private var launcherRegistered = false
+    private var activityRef: WeakReference<Activity>? = activity?.let { WeakReference(it) }
 
     // -----------------------------------------------------------------------
     // HealthDataProvider interface
     // -----------------------------------------------------------------------
 
+    /**
+     * Provide the current Activity. The permission launcher is registered here.
+     *
+     * IMPORTANT: For best reliability, call this during or before Activity.onCreate().
+     * Android's ActivityResultRegistry strongly recommends registering launchers
+     * unconditionally during the creation flow. Registering after onStart can cause
+     * crashes or state loss if the process is killed while a permission dialog is open.
+     */
     override fun setActivity(activity: Activity?) {
-        this.activity = activity
+        this.activityRef = activity?.let { WeakReference(it) }
         registerPermissionLauncher()
     }
 
     private fun registerPermissionLauncher() {
-        val act = activity as? ComponentActivity
+        val act = activityRef?.get() as? ComponentActivity
         if (act == null || launcherRegistered) return
 
         try {
@@ -80,6 +90,7 @@ class HealthConnectManager(
         return try {
             HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE
         } catch (e: Exception) {
+            logger("Health Connect availability check failed: ${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }
@@ -155,88 +166,75 @@ class HealthConnectManager(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Unified read methods (deduplicated)
+    // -----------------------------------------------------------------------
+
     override suspend fun readData(
         typeId: String,
         sinceTimestamp: Long?,
         limit: Int
-    ): ProviderReadResult = withContext(Dispatchers.IO) {
-        if (client == null) withContext(Dispatchers.Main) { connect() }
-        val hcClient = client ?: return@withContext ProviderReadResult(UnifiedHealthData(), null)
-
-        try {
-            when (typeId) {
-                "steps" -> readRecordType<StepsRecord>(hcClient, typeId, sinceTimestamp, limit) { convertSteps(it) }
-                "heartRate" -> readRecordType<HeartRateRecord>(hcClient, typeId, sinceTimestamp, limit) { convertHeartRate(it) }
-                "restingHeartRate" -> readRecordType<RestingHeartRateRecord>(hcClient, typeId, sinceTimestamp, limit) { convertRestingHeartRate(it) }
-                "heartRateVariabilitySDNN" -> readRecordType<HeartRateVariabilityRmssdRecord>(hcClient, typeId, sinceTimestamp, limit) { convertHrv(it) }
-                "oxygenSaturation" -> readRecordType<OxygenSaturationRecord>(hcClient, typeId, sinceTimestamp, limit) { convertOxygenSaturation(it) }
-                "bloodPressure", "bloodPressureSystolic", "bloodPressureDiastolic" -> readRecordType<BloodPressureRecord>(hcClient, typeId, sinceTimestamp, limit) { convertBloodPressure(it) }
-                "bloodGlucose" -> readRecordType<BloodGlucoseRecord>(hcClient, typeId, sinceTimestamp, limit) { convertBloodGlucose(it) }
-                "activeEnergy" -> readRecordType<ActiveCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit) { convertActiveCalories(it) }
-                "basalEnergy" -> readRecordType<BasalMetabolicRateRecord>(hcClient, typeId, sinceTimestamp, limit) { convertBasalCalories(it) }
-                "bodyTemperature" -> readRecordType<BodyTemperatureRecord>(hcClient, typeId, sinceTimestamp, limit) { convertBodyTemperature(it) }
-                "bodyMass" -> readRecordType<WeightRecord>(hcClient, typeId, sinceTimestamp, limit) { convertWeight(it) }
-                "height" -> readRecordType<HeightRecord>(hcClient, typeId, sinceTimestamp, limit) { convertHeight(it) }
-                "bodyFatPercentage" -> readRecordType<BodyFatRecord>(hcClient, typeId, sinceTimestamp, limit) { convertBodyFat(it) }
-                "leanBodyMass" -> readRecordType<LeanBodyMassRecord>(hcClient, typeId, sinceTimestamp, limit) { convertLeanBodyMass(it) }
-                "flightsClimbed" -> readRecordType<FloorsClimbedRecord>(hcClient, typeId, sinceTimestamp, limit) { convertFloors(it) }
-                "distanceWalkingRunning" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit) { convertDistance(it) }
-                "water", "dietaryWater" -> readRecordType<HydrationRecord>(hcClient, typeId, sinceTimestamp, limit) { convertHydration(it) }
-                "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit) { convertVo2Max(it) }
-                "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit) { convertRespiratoryRate(it) }
-                "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit) { convertDistance(it) }
-                "workout" -> readWorkouts(hcClient, sinceTimestamp, limit)
-                "sleep" -> readSleep(hcClient, sinceTimestamp, limit)
-                else -> ProviderReadResult(UnifiedHealthData(), null)
-            }
-        } catch (e: SecurityException) {
-            logger("  $typeId: missing permission, skipping")
-            ProviderReadResult(UnifiedHealthData(), null)
-        } catch (e: Exception) {
-            logger("Failed to read $typeId from Health Connect: ${e.javaClass.simpleName}: ${e.message}")
-            ProviderReadResult(UnifiedHealthData(), null)
-        }
-    }
+    ): ProviderReadResult = readRecordsInternal(
+        typeId = typeId,
+        sinceTimestamp = sinceTimestamp,
+        olderThanTimestamp = null,
+        limit = limit,
+        ascending = true
+    )
 
     override suspend fun readDataDescending(
         typeId: String,
         olderThanTimestamp: Long?,
         limit: Int
-    ): ProviderReadResult = withContext(Dispatchers.IO) {
-        if (client == null) withContext(Dispatchers.Main) { connect() }
+    ): ProviderReadResult = readRecordsInternal(
+        typeId = typeId,
+        sinceTimestamp = null,
+        olderThanTimestamp = olderThanTimestamp,
+        limit = limit,
+        ascending = false
+    )
+
+    private suspend fun readRecordsInternal(
+        typeId: String,
+        sinceTimestamp: Long?,
+        olderThanTimestamp: Long?,
+        limit: Int,
+        ascending: Boolean
+    ): ProviderReadResult = withContext(dispatchers.io) {
+        if (client == null) withContext(dispatchers.main) { connect() }
         val hcClient = client ?: return@withContext ProviderReadResult(UnifiedHealthData(), null, null)
 
         try {
             when (typeId) {
-                "steps" -> readRecordType<StepsRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertSteps(it) }
-                "heartRate" -> readRecordType<HeartRateRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertHeartRate(it) }
-                "restingHeartRate" -> readRecordType<RestingHeartRateRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertRestingHeartRate(it) }
-                "heartRateVariabilitySDNN" -> readRecordType<HeartRateVariabilityRmssdRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertHrv(it) }
-                "oxygenSaturation" -> readRecordType<OxygenSaturationRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertOxygenSaturation(it) }
-                "bloodPressure", "bloodPressureSystolic", "bloodPressureDiastolic" -> readRecordType<BloodPressureRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertBloodPressure(it) }
-                "bloodGlucose" -> readRecordType<BloodGlucoseRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertBloodGlucose(it) }
-                "activeEnergy" -> readRecordType<ActiveCaloriesBurnedRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertActiveCalories(it) }
-                "basalEnergy" -> readRecordType<BasalMetabolicRateRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertBasalCalories(it) }
-                "bodyTemperature" -> readRecordType<BodyTemperatureRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertBodyTemperature(it) }
-                "bodyMass" -> readRecordType<WeightRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertWeight(it) }
-                "height" -> readRecordType<HeightRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertHeight(it) }
-                "bodyFatPercentage" -> readRecordType<BodyFatRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertBodyFat(it) }
-                "leanBodyMass" -> readRecordType<LeanBodyMassRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertLeanBodyMass(it) }
-                "flightsClimbed" -> readRecordType<FloorsClimbedRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertFloors(it) }
-                "distanceWalkingRunning" -> readRecordType<DistanceRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertDistance(it) }
-                "water", "dietaryWater" -> readRecordType<HydrationRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertHydration(it) }
-                "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertVo2Max(it) }
-                "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertRespiratoryRate(it) }
-                "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp) { convertDistance(it) }
-                "workout" -> readWorkouts(hcClient, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp)
-                "sleep" -> readSleep(hcClient, null, limit, ascending = false, olderThanTimestamp = olderThanTimestamp)
+                "steps" -> readRecordType<StepsRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSteps(it) }
+                "heartRate" -> readRecordType<HeartRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHeartRate(it) }
+                "restingHeartRate" -> readRecordType<RestingHeartRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRestingHeartRate(it) }
+                "heartRateVariabilitySDNN" -> readRecordType<HeartRateVariabilityRmssdRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHrv(it) }
+                "oxygenSaturation" -> readRecordType<OxygenSaturationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertOxygenSaturation(it) }
+                "bloodPressure", "bloodPressureSystolic", "bloodPressureDiastolic" -> readRecordType<BloodPressureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBloodPressure(it) }
+                "bloodGlucose" -> readRecordType<BloodGlucoseRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBloodGlucose(it) }
+                "activeEnergy" -> readRecordType<ActiveCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertActiveCalories(it) }
+                "basalEnergy" -> readRecordType<BasalMetabolicRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBasalCalories(it) }
+                "bodyTemperature" -> readRecordType<BodyTemperatureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBodyTemperature(it) }
+                "bodyMass" -> readRecordType<WeightRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertWeight(it) }
+                "height" -> readRecordType<HeightRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHeight(it) }
+                "bodyFatPercentage" -> readRecordType<BodyFatRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBodyFat(it) }
+                "leanBodyMass" -> readRecordType<LeanBodyMassRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertLeanBodyMass(it) }
+                "flightsClimbed" -> readRecordType<FloorsClimbedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertFloors(it) }
+                "distanceWalkingRunning" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
+                "water", "dietaryWater" -> readRecordType<HydrationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHydration(it) }
+                "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertVo2Max(it) }
+                "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRespiratoryRate(it) }
+                "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
+                "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
+                "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
             }
         } catch (e: SecurityException) {
             logger("  $typeId: missing permission, skipping")
             ProviderReadResult(UnifiedHealthData(), null, null)
         } catch (e: Exception) {
-            logger("Failed to read $typeId (descending) from Health Connect: ${e.javaClass.simpleName}: ${e.message}")
+            logger("Failed to read $typeId from Health Connect: ${e.javaClass.simpleName}: ${e.message}")
             ProviderReadResult(UnifiedHealthData(), null, null)
         }
     }
@@ -329,7 +327,6 @@ class HealthConnectManager(
 
     private fun instantToIso(instant: Instant): String = UnifiedTimestamp.fromEpochMs(instant.toEpochMilli())
 
-    // ---- Steps ----
     private fun convertSteps(records: List<StepsRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -340,7 +337,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Heart Rate (split samples) ----
     private fun convertHeartRate(records: List<HeartRateRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = mutableListOf<UnifiedRecord>()
@@ -358,7 +354,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Resting Heart Rate ----
     private fun convertRestingHeartRate(records: List<RestingHeartRateRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -370,7 +365,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- HRV ----
     private fun convertHrv(records: List<HeartRateVariabilityRmssdRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -382,7 +376,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Oxygen Saturation ----
     private fun convertOxygenSaturation(records: List<OxygenSaturationRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -394,7 +387,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Blood Pressure (split) ----
     private fun convertBloodPressure(records: List<BloodPressureRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = mutableListOf<UnifiedRecord>()
@@ -434,7 +426,6 @@ class HealthConnectManager(
         else -> "unknown"
     }
 
-    // ---- Blood Glucose ----
     private fun convertBloodGlucose(records: List<BloodGlucoseRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -469,7 +460,6 @@ class HealthConnectManager(
         else -> "unknown"
     }
 
-    // ---- Active Calories ----
     private fun convertActiveCalories(records: List<ActiveCaloriesBurnedRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -480,7 +470,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Basal Metabolic Rate ----
     private fun convertBasalCalories(records: List<BasalMetabolicRateRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -492,7 +481,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Body Temperature ----
     private fun convertBodyTemperature(records: List<BodyTemperatureRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -507,20 +495,11 @@ class HealthConnectManager(
     }
 
     private fun mapTempLocation(loc: Int): String = when (loc) {
-        1 -> "armpit"
-        2 -> "finger"
-        3 -> "forehead"
-        4 -> "mouth"
-        5 -> "rectum"
-        6 -> "temporal_artery"
-        7 -> "toe"
-        8 -> "ear"
-        9 -> "wrist"
-        10 -> "vagina"
+        1 -> "armpit"; 2 -> "finger"; 3 -> "forehead"; 4 -> "mouth"; 5 -> "rectum"
+        6 -> "temporal_artery"; 7 -> "toe"; 8 -> "ear"; 9 -> "wrist"; 10 -> "vagina"
         else -> "unknown"
     }
 
-    // ---- Weight ----
     private fun convertWeight(records: List<WeightRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -532,7 +511,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Height ----
     private fun convertHeight(records: List<HeightRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -544,7 +522,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Body Fat ----
     private fun convertBodyFat(records: List<BodyFatRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -556,7 +533,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Lean Body Mass ----
     private fun convertLeanBodyMass(records: List<LeanBodyMassRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -568,7 +544,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Floors Climbed ----
     private fun convertFloors(records: List<FloorsClimbedRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -579,7 +554,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Distance ----
     private fun convertDistance(records: List<DistanceRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -590,7 +564,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Hydration (L → mL) ----
     private fun convertHydration(records: List<HydrationRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -601,7 +574,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- Respiratory Rate ----
     private fun convertRespiratoryRate(records: List<RespiratoryRateRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -613,7 +585,6 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
-    // ---- VO2 Max ----
     private fun convertVo2Max(records: List<Vo2MaxRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -847,22 +818,18 @@ class HealthConnectManager(
                 val zo = zoneStr(r.startZoneOffset)
                 val parentId = r.metadata.id
 
-                logger("  Sleep session $parentId: ${instantToIso(r.startTime)} → ${instantToIso(r.endTime)}")
-
                 val stages = try { r.stages } catch (e: Exception) {
                     logger("  Failed to read stages for $parentId: ${e.message}")
                     emptyList()
                 }
 
                 if (stages.isEmpty()) {
-                    logger("  No stages, adding as single 'sleeping' entry")
                     sleepEntries.add(UnifiedSleep(
                         parentId, null, "sleeping",
                         instantToIso(r.startTime), instantToIso(r.endTime),
                         zo, source, null, null
                     ))
                 } else {
-                    logger("  ${stages.size} stages found")
                     for ((idx, stage) in stages.withIndex()) {
                         sleepEntries.add(UnifiedSleep(
                             id = "$parentId-s$idx",

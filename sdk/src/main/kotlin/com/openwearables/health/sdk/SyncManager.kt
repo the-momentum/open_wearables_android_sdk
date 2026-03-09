@@ -3,9 +3,20 @@ package com.openwearables.health.sdk
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.work.*
-import com.google.gson.Gson
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,6 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
+@Serializable
 data class TypeSyncProgress(
     val typeIdentifier: String,
     var sentCount: Int = 0,
@@ -23,6 +35,7 @@ data class TypeSyncProgress(
     var pendingAnchorTimestamp: Long? = null
 )
 
+@Serializable
 data class SyncState(
     val userKey: String,
     val fullExport: Boolean,
@@ -48,33 +61,30 @@ class SyncManager(
     private val context: Context,
     private val secureStorage: SecureStorage,
     private val healthProvider: HealthDataProvider,
+    private val dispatchers: DispatcherProvider,
     private val logger: (String) -> Unit,
     private val onAuthError: ((Int, String) -> Unit)? = null
 ) {
     companion object {
         private const val TAG = "SyncManager"
-        private const val SYNC_PREFS_NAME = "com.openwearables.healthsdk.sync"
-        private const val KEY_ANCHORS = "anchors"
-        private const val WORK_NAME_PERIODIC = "health_sync_periodic"
-        private const val CHUNK_SIZE = 2000
-        private const val SYNC_INTERVAL_MINUTES = 5L
-        private const val SYNC_STATE_DIR = "health_sync_state"
-        private const val SYNC_STATE_FILE = "state.json"
-        const val SDK_VERSION = "0.2.0"
+
+        val sharedHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
+                .writeTimeout(120, TimeUnit.SECONDS)
+                .build()
+        }
     }
 
     private val syncPrefs: SharedPreferences by lazy {
-        context.getSharedPreferences(SYNC_PREFS_NAME, Context.MODE_PRIVATE)
+        context.getSharedPreferences(StorageKeys.SYNC_PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    private val gson = Gson()
-    private val prettyGson = com.google.gson.GsonBuilder().setPrettyPrinting().create()
+    private val json = Json { ignoreUnknownKeys = true }
+    private val prettyJson = Json { prettyPrint = true; ignoreUnknownKeys = true }
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .writeTimeout(120, TimeUnit.SECONDS)
-        .build()
+    private val httpClient = sharedHttpClient
 
     private val dateFormatter: java.time.format.DateTimeFormatter =
         java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
@@ -83,6 +93,14 @@ class SyncManager(
     private val isSyncing = AtomicBoolean(false)
     private val tokenRefreshLock = ReentrantLock()
     private var isRefreshingToken = false
+
+    private val stateMutex = Mutex()
+    private var inMemoryState: SyncState? = null
+
+    var syncIntervalMinutes: Long = SyncDefaults.SYNC_INTERVAL_MINUTES
+        set(value) {
+            field = maxOf(value, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)
+        }
 
     // MARK: - User Key
 
@@ -121,32 +139,32 @@ class SyncManager(
     // MARK: - Background Sync
 
     suspend fun startBackgroundSync(host: String, customSyncUrl: String?): Boolean {
-        withContext(Dispatchers.Main) {
-            val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
-                .build()
-
-            scheduleNextSync(host, customSyncUrl, constraints)
-            logger("Scheduled sync every $SYNC_INTERVAL_MINUTES minute(s)")
-        }
-
+        schedulePeriodicSync(host, customSyncUrl)
         syncNow(host, customSyncUrl, fullExport = !hasCompletedInitialSync())
         return true
     }
 
-    private fun scheduleNextSync(host: String, customSyncUrl: String?, constraints: Constraints) {
-        val work = OneTimeWorkRequestBuilder<HealthSyncWorker>()
+    private fun schedulePeriodicSync(host: String, customSyncUrl: String?) {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val work = PeriodicWorkRequestBuilder<HealthSyncWorker>(
+            syncIntervalMinutes, TimeUnit.MINUTES
+        )
             .setConstraints(constraints)
-            .setInitialDelay(SYNC_INTERVAL_MINUTES, TimeUnit.MINUTES)
             .setInputData(workDataOf(
                 HealthSyncWorker.KEY_HOST to host,
                 HealthSyncWorker.KEY_CUSTOM_SYNC_URL to customSyncUrl
             ))
             .build()
 
-        WorkManager.getInstance(context).enqueueUniqueWork(
-            WORK_NAME_PERIODIC, ExistingWorkPolicy.REPLACE, work
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+            SyncDefaults.WORK_NAME_PERIODIC,
+            ExistingPeriodicWorkPolicy.UPDATE,
+            work
         )
+        logger("Scheduled periodic sync every $syncIntervalMinutes minute(s)")
     }
 
     fun scheduleExpeditedSync(host: String, customSyncUrl: String?) {
@@ -164,16 +182,14 @@ class SyncManager(
             .build()
 
         WorkManager.getInstance(context).enqueueUniqueWork(
-            "health_sync_expedited", ExistingWorkPolicy.REPLACE, expeditedWork
+            SyncDefaults.WORK_NAME_EXPEDITED, ExistingWorkPolicy.REPLACE, expeditedWork
         )
         logger("Scheduled expedited sync")
     }
 
     suspend fun stopBackgroundSync() {
-        withContext(Dispatchers.Main) {
-            WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME_PERIODIC)
-            logger("Cancelled periodic sync")
-        }
+        WorkManager.getInstance(context).cancelUniqueWork(SyncDefaults.WORK_NAME_PERIODIC)
+        logger("Cancelled periodic sync")
     }
 
     // MARK: - Sync Now
@@ -199,17 +215,24 @@ class SyncManager(
                 return
             }
 
-            val existingState = loadSyncState()
+            val existingState = stateMutex.withLock { loadSyncStateFromDisk() }
             val isResuming = existingState != null && existingState.hasProgress
 
             val startIndex: Int
             if (isResuming) {
                 logger("Sync: resuming (${existingState!!.totalSentCount} sent, ${existingState.completedTypes.size}/${trackedTypes.size} types done)")
-                startIndex = getResumeTypeIndex()
+                startIndex = existingState.currentTypeIndex
+                stateMutex.withLock { inMemoryState = existingState }
             } else {
                 val mode = if (fullExport) "full export" else "incremental"
                 logger("Sync: starting ($mode, ${trackedTypes.size} types, ${healthProvider.providerName})")
-                startNewSyncState(fullExport)
+                stateMutex.withLock {
+                    inMemoryState = SyncState(
+                        userKey = userKey(), fullExport = fullExport,
+                        createdAt = System.currentTimeMillis()
+                    )
+                    persistStateToDisk()
+                }
                 startIndex = 0
             }
 
@@ -227,24 +250,38 @@ class SyncManager(
     ) {
         for (i in startIndex until types.size) {
             val type = types[i]
-            if (!shouldSyncType(type)) {
+
+            val alreadySynced = stateMutex.withLock {
+                inMemoryState?.completedTypes?.contains(type) == true
+            }
+            if (alreadySynced) {
                 logger("Skipping $type - already synced")
                 continue
             }
 
-            updateCurrentTypeIndex(i)
+            stateMutex.withLock {
+                inMemoryState?.currentTypeIndex = i
+            }
+
             val success = processType(type, fullExport, endpoint)
             if (!success) {
                 logger("Sync paused at $type, will resume later")
+                stateMutex.withLock { persistStateToDisk() }
                 return
             }
         }
-        finalizeSyncState()
+
+        stateMutex.withLock {
+            val state = inMemoryState ?: return
+            if (state.fullExport) markFullExportDone()
+            logger("Sync: complete (${state.totalSentCount} items, ${state.completedTypes.size} types)")
+            clearSyncSessionInternal()
+        }
     }
 
     private suspend fun processType(type: String, fullExport: Boolean, endpoint: String): Boolean {
         if (fullExport) {
-            return processTypeNewestFirst(type, olderThan = null, endpoint = endpoint)
+            return processTypeNewestFirst(type, endpoint)
         }
 
         val anchors = loadAnchors()
@@ -252,11 +289,13 @@ class SyncManager(
 
         logger("  $type: querying...")
 
-        val result = healthProvider.readData(type, anchor, CHUNK_SIZE)
+        val result = healthProvider.readData(type, anchor, SyncDefaults.CHUNK_SIZE)
 
         if (result.data.isEmpty) {
             logger("  $type: no new data")
-            updateTypeProgress(type, 0, isComplete = true, anchorTimestamp = null)
+            stateMutex.withLock {
+                updateInMemoryProgress(type, 0, isComplete = true, anchorTimestamp = null)
+            }
             return true
         }
 
@@ -265,7 +304,10 @@ class SyncManager(
         val sendResult = sendPayload(endpoint, payload)
 
         if (sendResult.success) {
-            updateTypeProgress(type, count, isComplete = true, anchorTimestamp = result.maxTimestamp)
+            stateMutex.withLock {
+                updateInMemoryProgress(type, count, isComplete = true, anchorTimestamp = result.maxTimestamp)
+                persistStateToDisk()
+            }
             logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
             return true
         } else {
@@ -276,59 +318,80 @@ class SyncManager(
     }
 
     /**
-     * Full-export: fetch data newest-first in chunks, matching the iOS
-     * `processTypeNewestFirst` strategy. Each chunk moves further back in time
-     * using the oldest record's timestamp as the cursor.
+     * Full-export: fetch data newest-first in chunks. Uses a while loop
+     * instead of recursion to avoid continuation chain buildup on large datasets.
      */
     private suspend fun processTypeNewestFirst(
         type: String,
-        olderThan: Long?,
         endpoint: String
     ): Boolean {
-        logger("  $type: querying (newest first${olderThan?.let { ", olderThan=${java.time.Instant.ofEpochMilli(it)}" } ?: ""})...")
+        var olderThan: Long? = null
 
-        val result = healthProvider.readDataDescending(type, olderThan, CHUNK_SIZE)
+        while (true) {
+            logger("  $type: querying (newest first${olderThan?.let { ", olderThan=${java.time.Instant.ofEpochMilli(it)}" } ?: ""})...")
 
-        if (result.data.isEmpty) {
-            logger("  $type: all data sent (newest first)")
-            updateTypeProgress(type, 0, isComplete = true, anchorTimestamp = null)
-            return true
+            val result = healthProvider.readDataDescending(type, olderThan, SyncDefaults.CHUNK_SIZE)
+
+            if (result.data.isEmpty) {
+                logger("  $type: all data sent (newest first)")
+                stateMutex.withLock {
+                    updateInMemoryProgress(type, 0, isComplete = true, anchorTimestamp = null)
+                    persistStateToDisk()
+                }
+                return true
+            }
+
+            val count = result.data.totalCount
+            val payload = buildPayload(result.data)
+            val sendResult = sendPayload(endpoint, payload)
+
+            if (!sendResult.success) {
+                val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
+                logger("  $type: $count items -> failed ($reason)")
+                return false
+            }
+
+            val anchorTs = if (olderThan == null) result.maxTimestamp else null
+            val isLastChunk = count < SyncDefaults.CHUNK_SIZE
+
+            logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+
+            stateMutex.withLock {
+                updateInMemoryProgress(type, count, isComplete = isLastChunk, anchorTimestamp = anchorTs)
+                if (isLastChunk) persistStateToDisk()
+            }
+
+            if (isLastChunk) return true
+
+            olderThan = result.minTimestamp
         }
+    }
 
-        val count = result.data.totalCount
-        val payload = buildPayload(result.data)
-        val sendResult = sendPayload(endpoint, payload)
-
-        if (!sendResult.success) {
-            val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
-            logger("  $type: $count items -> failed ($reason)")
-            return false
+    private fun updateInMemoryProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Boolean, anchorTimestamp: Long?) {
+        val state = inMemoryState ?: return
+        val progress = state.typeProgress.getOrPut(typeIdentifier) { TypeSyncProgress(typeIdentifier) }
+        progress.sentCount += sentInChunk
+        progress.isComplete = isComplete
+        if (anchorTimestamp != null) progress.pendingAnchorTimestamp = anchorTimestamp
+        state.totalSentCount += sentInChunk
+        if (isComplete) {
+            state.completedTypes.add(typeIdentifier)
+            progress.pendingAnchorTimestamp?.let { saveAnchor(typeIdentifier, it) }
         }
-
-        // Only save the anchor from the first chunk (the newest data's max timestamp)
-        val anchorTs = if (olderThan == null) result.maxTimestamp else null
-        val isLastChunk = count < CHUNK_SIZE
-
-        logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
-        updateTypeProgress(type, count, isComplete = isLastChunk, anchorTimestamp = anchorTs)
-
-        if (isLastChunk) return true
-
-        return processTypeNewestFirst(type, result.minTimestamp, endpoint)
     }
 
     // MARK: - Payload (unified)
 
     private fun buildPayload(data: UnifiedHealthData): Map<String, Any> = mapOf(
         "provider" to healthProvider.providerId,
-        "sdkVersion" to SDK_VERSION,
+        "sdkVersion" to SyncDefaults.SDK_VERSION,
         "syncTimestamp" to UnifiedTimestamp.fromEpochMs(System.currentTimeMillis()),
         "data" to data.toDataMap()
     )
 
     // MARK: - Token Refresh
 
-    private suspend fun attemptTokenRefresh(): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun attemptTokenRefresh(): Boolean = withContext(dispatchers.io) {
         tokenRefreshLock.withLock { isRefreshingToken = true }
         try {
             val refreshToken = secureStorage.getRefreshToken()
@@ -340,7 +403,8 @@ class SyncManager(
 
             android.util.Log.d(TAG, "Attempting token refresh...")
             val url = "$apiBaseUrl/token/refresh"
-            val body = gson.toJson(mapOf("refresh_token" to refreshToken))
+            val bodyMap = mapOf("refresh_token" to refreshToken)
+            val body = json.encodeToString(bodyMap)
             val request = Request.Builder()
                 .url(url)
                 .post(body.toRequestBody("application/json".toMediaType()))
@@ -352,11 +416,11 @@ class SyncManager(
             android.util.Log.d(TAG, "Token refresh response [${response.code}]: $responseBody")
 
             if (response.isSuccessful && responseBody != null) {
-                @Suppress("UNCHECKED_CAST")
-                val json = gson.fromJson(responseBody, Map::class.java) as? Map<String, Any>
-                val newAccessToken = json?.get("access_token") as? String
+                val jsonObj = json.parseToJsonElement(responseBody).jsonObject
+                val newAccessToken = jsonObj["access_token"]?.jsonPrimitive?.contentOrNull
                 if (newAccessToken != null) {
-                    secureStorage.updateTokens(newAccessToken, json["refresh_token"] as? String)
+                    val newRefreshToken = jsonObj["refresh_token"]?.jsonPrimitive?.contentOrNull
+                    secureStorage.updateTokens(newAccessToken, newRefreshToken)
                     logger("Token refreshed")
                     return@withContext true
                 }
@@ -376,12 +440,35 @@ class SyncManager(
 
     private data class SendResult(val success: Boolean, val statusCode: Int?, val payloadSizeKb: Int)
 
-    private suspend fun sendPayload(endpoint: String, payload: Map<String, Any>): SendResult =
-        withContext(Dispatchers.IO) {
+    private suspend fun sendPayload(endpoint: String, payload: Map<String, Any>): SendResult {
+        val jsonBody = serializePayload(payload)
+        return sendPayloadRaw(endpoint, jsonBody)
+    }
+
+    private fun serializePayload(payload: Map<String, Any>): String {
+        val element = mapToJsonElement(payload)
+        return json.encodeToString(JsonElement.serializer(), element)
+    }
+
+    private fun mapToJsonElement(value: Any?): JsonElement {
+        return when (value) {
+            null -> JsonNull
+            is Boolean -> JsonPrimitive(value)
+            is Number -> JsonPrimitive(value)
+            is String -> JsonPrimitive(value)
+            is Map<*, *> -> JsonObject(
+                value.entries.associate { (k, v) -> k.toString() to mapToJsonElement(v) }
+            )
+            is List<*> -> JsonArray(value.map { mapToJsonElement(it) })
+            else -> JsonPrimitive(value.toString())
+        }
+    }
+
+    private suspend fun sendPayloadRaw(endpoint: String, jsonBody: String): SendResult =
+        withContext(dispatchers.io) {
             try {
-                val jsonBody = gson.toJson(payload)
                 val sizeKb = jsonBody.length / 1024
-                android.util.Log.d(TAG, "REQUEST [$endpoint] (${sizeKb} KB):\n${prettyGson.toJson(payload)}")
+                android.util.Log.d(TAG, "REQUEST [$endpoint] (${sizeKb} KB)")
 
                 val requestBuilder = Request.Builder()
                     .url(endpoint)
@@ -458,23 +545,26 @@ class SyncManager(
     // MARK: - Anchors
 
     private fun loadAnchors(): Map<String, Long> {
-        val json = syncPrefs.getString(KEY_ANCHORS, null) ?: return emptyMap()
+        val jsonStr = syncPrefs.getString(StorageKeys.KEY_ANCHORS, null) ?: return emptyMap()
         return try {
-            @Suppress("UNCHECKED_CAST")
-            val map = gson.fromJson(json, Map::class.java) as? Map<String, Double>
-            map?.mapValues { it.value.toLong() } ?: emptyMap()
+            val map = json.decodeFromString<Map<String, Double>>(jsonStr)
+            map.mapValues { it.value.toLong() }
         } catch (_: Exception) { emptyMap() }
     }
 
     private fun saveAnchor(type: String, timestamp: Long) {
         val current = loadAnchors().toMutableMap()
         current[type] = timestamp
-        syncPrefs.edit().putString(KEY_ANCHORS, gson.toJson(current)).apply()
+        val element = mapToJsonElement(current)
+        syncPrefs.edit().putString(
+            StorageKeys.KEY_ANCHORS,
+            json.encodeToString(JsonElement.serializer(), element)
+        ).apply()
     }
 
     fun resetAnchors() {
         syncPrefs.edit()
-            .remove(KEY_ANCHORS)
+            .remove(StorageKeys.KEY_ANCHORS)
             .putBoolean(fullDoneKey(), false)
             .apply()
         clearSyncSession()
@@ -485,18 +575,19 @@ class SyncManager(
     private fun hasCompletedInitialSync(): Boolean = syncPrefs.getBoolean(fullDoneKey(), false)
     private fun markFullExportDone() { syncPrefs.edit().putBoolean(fullDoneKey(), true).apply() }
 
-    // MARK: - Sync State
+    // MARK: - Sync State (Mutex-protected disk I/O)
 
-    private fun syncStateDir(): File = File(context.filesDir, SYNC_STATE_DIR).also { if (!it.exists()) it.mkdirs() }
-    private fun syncStateFile(): File = File(syncStateDir(), SYNC_STATE_FILE)
+    private fun syncStateDir(): File = File(context.filesDir, StorageKeys.SYNC_STATE_DIR).also { if (!it.exists()) it.mkdirs() }
+    private fun syncStateFile(): File = File(syncStateDir(), StorageKeys.SYNC_STATE_FILE)
 
-    private fun saveSyncState(state: SyncState) {
+    private fun persistStateToDisk() {
+        val state = inMemoryState ?: return
         try {
-            val json = gson.toJson(state)
-            if (json.isNotBlank() && json.startsWith("{")) {
+            val jsonStr = json.encodeToString(state)
+            if (jsonStr.isNotBlank() && jsonStr.startsWith("{")) {
                 val file = syncStateFile()
                 val tempFile = File(file.parent, "${file.name}.tmp")
-                tempFile.writeText(json)
+                tempFile.writeText(jsonStr)
                 tempFile.renameTo(file)
             }
         } catch (e: Exception) {
@@ -504,14 +595,14 @@ class SyncManager(
         }
     }
 
-    private fun loadSyncState(): SyncState? {
+    private fun loadSyncStateFromDisk(): SyncState? {
         return try {
             val file = syncStateFile()
             if (!file.exists()) return null
-            val json = file.readText()
-            if (json.isBlank()) { file.delete(); return null }
-            val state = gson.fromJson(json, SyncState::class.java)
-            if (state == null || state.userKey != userKey()) { clearSyncSession(); return null }
+            val jsonStr = file.readText()
+            if (jsonStr.isBlank()) { file.delete(); return null }
+            val state = json.decodeFromString<SyncState>(jsonStr)
+            if (state.userKey != userKey()) { clearSyncSessionInternal(); return null }
             state
         } catch (e: Exception) {
             logger("Corrupted sync state, clearing: ${e.message}")
@@ -520,52 +611,13 @@ class SyncManager(
         }
     }
 
-    private fun startNewSyncState(fullExport: Boolean): SyncState {
-        val state = SyncState(
-            userKey = userKey(), fullExport = fullExport,
-            createdAt = System.currentTimeMillis()
-        )
-        saveSyncState(state)
-        return state
+    private fun clearSyncSessionInternal() {
+        inMemoryState = null
+        try { syncStateFile().delete() } catch (_: Exception) {}
     }
-
-    private fun updateTypeProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Boolean, anchorTimestamp: Long?) {
-        val state = loadSyncState() ?: return
-        var progress = state.typeProgress[typeIdentifier] ?: TypeSyncProgress(typeIdentifier)
-        progress.sentCount += sentInChunk
-        progress.isComplete = isComplete
-        if (anchorTimestamp != null) progress.pendingAnchorTimestamp = anchorTimestamp
-        state.typeProgress[typeIdentifier] = progress
-        state.totalSentCount += sentInChunk
-        if (isComplete) {
-            state.completedTypes.add(typeIdentifier)
-            progress.pendingAnchorTimestamp?.let { saveAnchor(typeIdentifier, it) }
-        }
-        saveSyncState(state)
-    }
-
-    private fun updateCurrentTypeIndex(index: Int) {
-        val state = loadSyncState() ?: return
-        state.currentTypeIndex = index
-        saveSyncState(state)
-    }
-
-    private fun finalizeSyncState() {
-        val state = loadSyncState() ?: return
-        if (state.fullExport) markFullExportDone()
-        logger("Sync: complete (${state.totalSentCount} items, ${state.completedTypes.size} types)")
-        clearSyncSession()
-    }
-
-    private fun shouldSyncType(typeIdentifier: String): Boolean {
-        val state = loadSyncState() ?: return true
-        return !state.completedTypes.contains(typeIdentifier)
-    }
-
-    private fun getResumeTypeIndex(): Int = loadSyncState()?.currentTypeIndex ?: 0
 
     fun getSyncStatus(): Map<String, Any?> {
-        val state = loadSyncState()
+        val state = inMemoryState ?: loadSyncStateFromDisk()
         return if (state != null) {
             mapOf(
                 "hasResumableSession" to state.hasProgress,
@@ -585,118 +637,12 @@ class SyncManager(
         }
     }
 
-    fun hasResumableSyncSession(): Boolean = loadSyncState()?.hasProgress == true
+    fun hasResumableSyncSession(): Boolean {
+        return (inMemoryState ?: loadSyncStateFromDisk())?.hasProgress == true
+    }
 
     fun clearSyncSession() {
-        try {
-            syncStateFile().delete()
-            logger("Cleared sync state")
-        } catch (e: Exception) {
-            logger("Failed to clear sync state: ${e.message}")
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WorkManager worker
-// ---------------------------------------------------------------------------
-
-class HealthSyncWorker(
-    context: Context,
-    params: WorkerParameters
-) : CoroutineWorker(context, params) {
-
-    companion object {
-        const val KEY_HOST = "host"
-        const val KEY_CUSTOM_SYNC_URL = "customSyncUrl"
-        private const val NOTIFICATION_ID = 9001
-        private const val CHANNEL_ID = "health_sync_channel"
-        private const val WORK_NAME_PERIODIC = "health_sync_periodic"
-        private const val SYNC_INTERVAL_MINUTES = 5L
-    }
-
-    override suspend fun doWork(): Result {
-        val host = inputData.getString(KEY_HOST) ?: return Result.failure()
-        val customSyncUrl = inputData.getString(KEY_CUSTOM_SYNC_URL)
-
-        try {
-            setForeground(getForegroundInfo())
-            android.util.Log.d("HealthSyncWorker", "Running as foreground service")
-        } catch (e: Exception) {
-            android.util.Log.w("HealthSyncWorker", "Could not promote to foreground: ${e.message}")
-        }
-
-        val secureStorage = SecureStorage(applicationContext)
-        val provider = createProvider(applicationContext, secureStorage)
-        val syncManager = SyncManager(applicationContext, secureStorage, provider, {
-            android.util.Log.d("HealthSyncWorker", it)
-        })
-
-        return try {
-            val trackedTypes = secureStorage.getTrackedTypes()
-            provider.setTrackedTypes(trackedTypes)
-
-            android.util.Log.d("HealthSyncWorker", "Background sync (provider: ${provider.providerId})")
-            syncManager.syncNow(host, customSyncUrl, fullExport = false)
-
-            scheduleNextSync(host, customSyncUrl)
-            Result.success()
-        } catch (e: Exception) {
-            android.util.Log.e("HealthSyncWorker", "Sync failed", e)
-            scheduleNextSync(host, customSyncUrl)
-            Result.retry()
-        }
-    }
-
-    private fun createProvider(context: Context, storage: SecureStorage): HealthDataProvider {
-        val providerId = storage.getProvider()
-        val log: (String) -> Unit = { android.util.Log.d("HealthSyncWorker", it) }
-        return when (providerId) {
-            "google" -> HealthConnectManager(context, null, log)
-            else -> SamsungHealthManager(context, null, log)
-        }
-    }
-
-    private fun scheduleNextSync(host: String, customSyncUrl: String?) {
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .build()
-        val nextWork = OneTimeWorkRequestBuilder<HealthSyncWorker>()
-            .setConstraints(constraints)
-            .setInitialDelay(SYNC_INTERVAL_MINUTES, TimeUnit.MINUTES)
-            .setInputData(workDataOf(
-                KEY_HOST to host,
-                KEY_CUSTOM_SYNC_URL to customSyncUrl
-            ))
-            .build()
-        WorkManager.getInstance(applicationContext).enqueueUniqueWork(
-            WORK_NAME_PERIODIC, ExistingWorkPolicy.REPLACE, nextWork
-        )
-    }
-
-    override suspend fun getForegroundInfo(): ForegroundInfo {
-        createNotificationChannel()
-        val notification = androidx.core.app.NotificationCompat.Builder(applicationContext, CHANNEL_ID)
-            .setContentTitle("Health Sync")
-            .setContentText("Syncing health data...")
-            .setSmallIcon(android.R.drawable.ic_popup_sync)
-            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .build()
-        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            ForegroundInfo(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            ForegroundInfo(NOTIFICATION_ID, notification)
-        }
-    }
-
-    private fun createNotificationChannel() {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            val channel = android.app.NotificationChannel(
-                CHANNEL_ID, "Health Sync", android.app.NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "Background health data synchronization" }
-            (applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager)
-                .createNotificationChannel(channel)
-        }
+        clearSyncSessionInternal()
+        logger("Cleared sync state")
     }
 }
