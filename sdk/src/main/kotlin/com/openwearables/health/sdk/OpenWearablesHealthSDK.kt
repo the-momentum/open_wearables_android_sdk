@@ -7,6 +7,15 @@ import kotlinx.coroutines.*
 import java.lang.ref.WeakReference
 
 /**
+ * Controls which log messages the SDK emits.
+ *
+ * - [NONE]:   No logs at all.
+ * - [ALWAYS]: Logs are always emitted (Logcat + listener).
+ * - [DEBUG]:  Logs are emitted only in debug builds (the default).
+ */
+enum class OWLogLevel { NONE, ALWAYS, DEBUG }
+
+/**
  * Main entry point for the Open Wearables Health SDK.
  *
  * Provides a unified API for reading health data from Samsung Health and
@@ -69,6 +78,9 @@ class OpenWearablesHealthSDK private constructor(
     // Listeners
     var logListener: ((String) -> Unit)? = null
     var authErrorListener: ((statusCode: Int, message: String) -> Unit)? = null
+
+    /// Current log level. Default is DEBUG (logs only in debuggable builds).
+    var logLevel: OWLogLevel = OWLogLevel.DEBUG
 
     // Components
     internal val secureStorage: SecureStorage by lazy { SecureStorage(context) }
@@ -239,9 +251,20 @@ class OpenWearablesHealthSDK private constructor(
     // Sync
     // -----------------------------------------------------------------------
 
-    suspend fun startBackgroundSync() {
+    /**
+     * Start background health data synchronization.
+     *
+     * @param syncDaysBack How many days back to sync. Syncs from the start of the day
+     *   that many days ago (inclusive). When `null` (the default), syncs all available history.
+     */
+    suspend fun startBackgroundSync(syncDaysBack: Int? = null) {
         val h = host ?: throw IllegalStateException("Not configured")
         if (!secureStorage.hasSession()) throw IllegalStateException("Not signed in")
+
+        if (syncDaysBack != null) {
+            secureStorage.saveSyncDaysBack(syncDaysBack)
+            logMessage("Sync days back set to $syncDaysBack")
+        }
 
         secureStorage.setSyncActive(true)
         logMessage("Background sync started (${getOrCreateProvider().providerName})")
@@ -415,6 +438,14 @@ class OpenWearablesHealthSDK private constructor(
     }
 
     internal fun logMessage(message: String) {
+        when (logLevel) {
+            OWLogLevel.NONE -> return
+            OWLogLevel.ALWAYS -> { /* proceed */ }
+            OWLogLevel.DEBUG -> {
+                val isDebuggable = (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                if (!isDebuggable) return
+            }
+        }
         Log.d(TAG, message)
         logListener?.invoke(message)
     }
