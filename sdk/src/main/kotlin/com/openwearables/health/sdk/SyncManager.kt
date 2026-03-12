@@ -102,6 +102,25 @@ class SyncManager(
             field = maxOf(value, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)
         }
 
+    // MARK: - Sync Start Timestamp
+
+    /**
+     * Computes the earliest epoch-ms timestamp to sync from, based on persisted `syncDaysBack`.
+     * Returns the start of the day (midnight local time) that many days ago,
+     * or `null` if full sync (no limit) is configured.
+     */
+    private fun syncStartTimestamp(): Long? {
+        val daysBack = secureStorage.getSyncDaysBack()
+        if (daysBack <= 0) return null
+        val cal = java.util.Calendar.getInstance()
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        cal.add(java.util.Calendar.DAY_OF_YEAR, -daysBack)
+        return cal.timeInMillis
+    }
+
     // MARK: - User Key
 
     private fun userKey(): String {
@@ -218,14 +237,17 @@ class SyncManager(
             val existingState = stateMutex.withLock { loadSyncStateFromDisk() }
             val isResuming = existingState != null && existingState.hasProgress
 
+            val floor = syncStartTimestamp()
+            val floorLabel = if (floor != null) "since ${java.time.Instant.ofEpochMilli(floor)}" else "full history"
+
             val startIndex: Int
             if (isResuming) {
-                logger("Sync: resuming (${existingState!!.totalSentCount} sent, ${existingState.completedTypes.size}/${trackedTypes.size} types done)")
+                logger("Sync: resuming (${existingState!!.totalSentCount} sent, ${existingState.completedTypes.size}/${trackedTypes.size} types done, $floorLabel)")
                 startIndex = existingState.currentTypeIndex
                 stateMutex.withLock { inMemoryState = existingState }
             } else {
                 val mode = if (fullExport) "full export" else "incremental"
-                logger("Sync: starting ($mode, ${trackedTypes.size} types, ${healthProvider.providerName})")
+                logger("Sync: starting ($mode, ${trackedTypes.size} types, ${healthProvider.providerName}, $floorLabel)")
                 stateMutex.withLock {
                     inMemoryState = SyncState(
                         userKey = userKey(), fullExport = fullExport,
@@ -285,7 +307,13 @@ class SyncManager(
         }
 
         val anchors = loadAnchors()
-        val anchor = anchors[type]
+        val storedAnchor = anchors[type]
+        val floor = syncStartTimestamp()
+        val anchor = when {
+            storedAnchor != null && floor != null -> maxOf(storedAnchor, floor)
+            storedAnchor != null -> storedAnchor
+            else -> floor
+        }
 
         logger("  $type: querying...")
 
@@ -301,6 +329,7 @@ class SyncManager(
 
         val count = result.data.totalCount
         val payload = buildPayload(result.data)
+        logPayloadSummary(result.data)
         val sendResult = sendPayload(endpoint, payload)
 
         if (sendResult.success) {
@@ -326,6 +355,8 @@ class SyncManager(
         endpoint: String
     ): Boolean {
         var olderThan: Long? = null
+        val floor = syncStartTimestamp()
+        val floorIso = floor?.let { UnifiedTimestamp.fromEpochMs(it) }
 
         while (true) {
             logger("  $type: querying (newest first${olderThan?.let { ", olderThan=${java.time.Instant.ofEpochMilli(it)}" } ?: ""})...")
@@ -341,8 +372,23 @@ class SyncManager(
                 return true
             }
 
-            val count = result.data.totalCount
-            val payload = buildPayload(result.data)
+            val reachedFloor = floor != null && result.minTimestamp != null && result.minTimestamp <= floor
+            val isLastChunk = result.data.totalCount < SyncDefaults.CHUNK_SIZE || reachedFloor
+
+            val data = if (reachedFloor && floorIso != null) result.data.filterSince(floorIso) else result.data
+
+            if (data.isEmpty) {
+                logger("  $type: all data within range sent")
+                stateMutex.withLock {
+                    updateInMemoryProgress(type, 0, isComplete = true, anchorTimestamp = null)
+                    persistStateToDisk()
+                }
+                return true
+            }
+
+            val count = data.totalCount
+            val payload = buildPayload(data)
+            logPayloadSummary(data)
             val sendResult = sendPayload(endpoint, payload)
 
             if (!sendResult.success) {
@@ -352,9 +398,8 @@ class SyncManager(
             }
 
             val anchorTs = if (olderThan == null) result.maxTimestamp else null
-            val isLastChunk = count < SyncDefaults.CHUNK_SIZE
 
-            logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+            logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}${if (reachedFloor) " [reached sync boundary]" else ""}")
 
             stateMutex.withLock {
                 updateInMemoryProgress(type, count, isComplete = isLastChunk, anchorTimestamp = anchorTs)
@@ -388,6 +433,82 @@ class SyncManager(
         "syncTimestamp" to UnifiedTimestamp.fromEpochMs(System.currentTimeMillis()),
         "data" to data.toDataMap()
     )
+
+    // MARK: - Payload Summary Logging
+
+    private val valueSumTypes = setOf(
+        "steps", "active_calories_burned", "basal_calories_burned",
+        "distance", "floors_climbed",
+        "StepCount", "ActiveEnergyBurned", "BasalEnergyBurned",
+        "DistanceWalkingRunning", "FlightsClimbed",
+    )
+
+    private fun logPayloadSummary(data: UnifiedHealthData) {
+        val stats = mutableMapOf<String, PayloadTypeStats>()
+
+        for (r in data.records) {
+            val s = stats.getOrPut(r.type) { PayloadTypeStats() }
+            s.count++
+            s.updateDateRange(r.startDate)
+            if (r.type in valueSumTypes) {
+                s.unit = r.unit
+                val dayKey = r.startDate.take(10)
+                s.dailyValues[dayKey] = (s.dailyValues[dayKey] ?: 0.0) + r.value
+            }
+        }
+        for (sl in data.sleep) {
+            val s = stats.getOrPut("sleep") { PayloadTypeStats() }
+            s.count++
+            s.updateDateRange(sl.startDate)
+        }
+        for (w in data.workouts) {
+            val key = "workout/${w.type}"
+            val s = stats.getOrPut(key) { PayloadTypeStats() }
+            s.count++
+            s.updateDateRange(w.startDate)
+        }
+
+        val totalCount = stats.values.sumOf { it.count }
+        logger("Sending $totalCount items:")
+
+        for ((type, ts) in stats.entries.sortedByDescending { it.value.count }) {
+            val range = if (ts.minDate != null && ts.maxDate != null) {
+                "${ts.minDate!!.take(16).replace('T', ' ')} → ${ts.maxDate!!.take(16).replace('T', ' ')}"
+            } else "no dates"
+
+            if (ts.dailyValues.isEmpty()) {
+                logger("  ✅ $type: ${ts.count} ($range)")
+            } else {
+                val total = ts.dailyValues.values.sum()
+                val unit = ts.unit ?: ""
+                logger("  ✅ $type: ${ts.count} samples, ${formatNumber(total)} $unit total ($range)")
+                for (day in ts.dailyValues.keys.sorted()) {
+                    logger("     $day: ${formatNumber(ts.dailyValues[day]!!)} $unit")
+                }
+            }
+        }
+    }
+
+    private class PayloadTypeStats(
+        var count: Int = 0,
+        var minDate: String? = null,
+        var maxDate: String? = null,
+        var unit: String? = null,
+        val dailyValues: MutableMap<String, Double> = mutableMapOf()
+    ) {
+        fun updateDateRange(date: String) {
+            if (minDate == null || date < minDate!!) minDate = date
+            if (maxDate == null || date > maxDate!!) maxDate = date
+        }
+    }
+
+    private fun formatNumber(value: Double): String {
+        return if (value == value.toLong().toDouble()) {
+            "%,d".format(value.toLong())
+        } else {
+            "%.1f".format(value)
+        }
+    }
 
     // MARK: - Token Refresh
 

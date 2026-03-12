@@ -153,6 +153,16 @@ data class UnifiedHealthData(
         "workouts" to workouts.map { it.toMap() },
         "sleep" to sleep.map { it.toMap() }
     )
+
+    /**
+     * Returns a copy with only records/workouts/sleep whose startDate >= [floorIso].
+     * The ISO string comparison works because dates are in ISO-8601 format (lexicographic order).
+     */
+    fun filterSince(floorIso: String): UnifiedHealthData = UnifiedHealthData(
+        records = records.filter { it.startDate >= floorIso },
+        workouts = workouts.filter { it.startDate >= floorIso },
+        sleep = sleep.filter { it.startDate >= floorIso },
+    )
 }
 
 data class ProviderReadResult(

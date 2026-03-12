@@ -33,6 +33,7 @@ class SecureStorage(private val context: Context) {
         private const val KEY_TRACKED_TYPES = "trackedTypes"
         private const val KEY_HEALTH_PROVIDER = "healthProvider"
         private const val KEY_APP_INSTALLED = "appInstalled"
+        private const val KEY_SYNC_DAYS_BACK = "syncDaysBack"
     }
 
     /**
@@ -198,6 +199,15 @@ class SecureStorage(private val context: Context) {
     fun getTrackedTypes(): List<String> {
         return configPrefs.getStringSet(KEY_TRACKED_TYPES, emptySet())?.toList() ?: emptyList()
     }
+
+    // MARK: - Sync Days Back
+
+    fun saveSyncDaysBack(days: Int) {
+        configPrefs.edit().putInt(KEY_SYNC_DAYS_BACK, days).apply()
+    }
+
+    /** Returns stored sync days back, or 0 if not set (meaning full sync / no limit). */
+    fun getSyncDaysBack(): Int = configPrefs.getInt(KEY_SYNC_DAYS_BACK, 0)
 
     // MARK: - Health Provider
 
