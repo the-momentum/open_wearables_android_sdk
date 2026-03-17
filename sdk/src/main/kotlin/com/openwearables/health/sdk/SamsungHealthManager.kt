@@ -524,6 +524,7 @@ class SamsungHealthManager(
                 dataType = typeId.uppercase(),
                 startTime = startMs,
                 endTime = endMs ?: startMs,
+                zoneOffset = null,
                 dataSource = RawDataSource(null, null),
                 device = DeviceInfo(
                     deviceId = null, manufacturer = Build.MANUFACTURER, model = Build.MODEL,
@@ -574,7 +575,7 @@ class SamsungHealthManager(
 
     private fun convertRecords(typeId: String, raw: HealthDataRecord): List<UnifiedRecord>? {
         val source = buildUnifiedSource(raw)
-        val zoneOffset = UnifiedTimestamp.zoneOffsetString()
+        val zoneOffset = raw.zoneOffset
         val startDate = UnifiedTimestamp.fromEpochMs(raw.startTime)
         val endDate = UnifiedTimestamp.fromEpochMs(raw.endTime ?: raw.startTime)
 
@@ -679,7 +680,7 @@ class SamsungHealthManager(
     @Suppress("UNCHECKED_CAST")
     private fun convertWorkout(raw: HealthDataRecord): List<UnifiedWorkout>? {
         val source = buildUnifiedSource(raw)
-        val zoneOffset = UnifiedTimestamp.zoneOffsetString()
+        val zoneOffset = raw.zoneOffset
         val exerciseType = raw.fields["EXERCISE_TYPE"]?.toString() ?: "UNKNOWN"
 
         val sessions = raw.fields["SESSIONS"] as? List<Map<String, Any?>> ?: emptyList()
@@ -797,7 +798,7 @@ class SamsungHealthManager(
     @Suppress("UNCHECKED_CAST")
     private fun convertSleep(raw: HealthDataRecord): List<UnifiedSleep>? {
         val source = buildUnifiedSource(raw)
-        val zoneOffset = UnifiedTimestamp.zoneOffsetString()
+        val zoneOffset = raw.zoneOffset
         val sleepScore = raw.fields["SLEEP_SCORE"] as? Number
         val scoreValues = sleepScore?.let { listOf(mapOf("type" to "sleepScore", "value" to it, "unit" to "score")) }
 
@@ -1046,6 +1047,7 @@ class SamsungHealthManager(
                 dataType = getDataTypeName(typeId),
                 startTime = dataPoint.startTime.toEpochMilli(),
                 endTime = dataPoint.endTime?.toEpochMilli(),
+                zoneOffset = dataPoint.zoneOffset?.toString(),
                 dataSource = RawDataSource(source?.appId, source?.deviceId),
                 device = getDeviceInfo(source),
                 fields = extractFieldsForType(typeId, dataPoint)

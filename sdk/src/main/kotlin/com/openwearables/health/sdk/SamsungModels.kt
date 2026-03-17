@@ -10,6 +10,7 @@ data class HealthDataRecord(
     val dataType: String,
     val startTime: Long,
     val endTime: Long?,
+    val zoneOffset: String?,
     val dataSource: RawDataSource,
     val device: DeviceInfo,
     val fields: Map<String, Any?>

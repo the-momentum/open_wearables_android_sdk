@@ -436,78 +436,25 @@ class SyncManager(
 
     // MARK: - Payload Summary Logging
 
-    private val valueSumTypes = setOf(
-        "steps", "active_calories_burned", "basal_calories_burned",
-        "distance", "floors_climbed",
-        "StepCount", "ActiveEnergyBurned", "BasalEnergyBurned",
-        "DistanceWalkingRunning", "FlightsClimbed",
-    )
-
     private fun logPayloadSummary(data: UnifiedHealthData) {
-        val stats = mutableMapOf<String, PayloadTypeStats>()
+        val typeCounts = mutableMapOf<String, Int>()
 
         for (r in data.records) {
-            val s = stats.getOrPut(r.type) { PayloadTypeStats() }
-            s.count++
-            s.updateDateRange(r.startDate)
-            if (r.type in valueSumTypes) {
-                s.unit = r.unit
-                val dayKey = r.startDate.take(10)
-                s.dailyValues[dayKey] = (s.dailyValues[dayKey] ?: 0.0) + r.value
-            }
+            typeCounts[r.type] = (typeCounts[r.type] ?: 0) + 1
         }
-        for (sl in data.sleep) {
-            val s = stats.getOrPut("sleep") { PayloadTypeStats() }
-            s.count++
-            s.updateDateRange(sl.startDate)
+        if (data.sleep.isNotEmpty()) {
+            typeCounts["sleep"] = data.sleep.size
         }
-        for (w in data.workouts) {
-            val key = "workout/${w.type}"
-            val s = stats.getOrPut(key) { PayloadTypeStats() }
-            s.count++
-            s.updateDateRange(w.startDate)
+        if (data.workouts.isNotEmpty()) {
+            typeCounts["workouts"] = data.workouts.size
         }
 
-        val totalCount = stats.values.sumOf { it.count }
-        logger("Sending $totalCount items:")
+        val totalCount = typeCounts.values.sum()
+        val breakdown = typeCounts.entries
+            .sortedByDescending { it.value }
+            .joinToString(", ") { "${it.key}: ${it.value}" }
 
-        for ((type, ts) in stats.entries.sortedByDescending { it.value.count }) {
-            val range = if (ts.minDate != null && ts.maxDate != null) {
-                "${ts.minDate!!.take(16).replace('T', ' ')} → ${ts.maxDate!!.take(16).replace('T', ' ')}"
-            } else "no dates"
-
-            if (ts.dailyValues.isEmpty()) {
-                logger("  ✅ $type: ${ts.count} ($range)")
-            } else {
-                val total = ts.dailyValues.values.sum()
-                val unit = ts.unit ?: ""
-                logger("  ✅ $type: ${ts.count} samples, ${formatNumber(total)} $unit total ($range)")
-                for (day in ts.dailyValues.keys.sorted()) {
-                    logger("     $day: ${formatNumber(ts.dailyValues[day]!!)} $unit")
-                }
-            }
-        }
-    }
-
-    private class PayloadTypeStats(
-        var count: Int = 0,
-        var minDate: String? = null,
-        var maxDate: String? = null,
-        var unit: String? = null,
-        val dailyValues: MutableMap<String, Double> = mutableMapOf()
-    ) {
-        fun updateDateRange(date: String) {
-            if (minDate == null || date < minDate!!) minDate = date
-            if (maxDate == null || date > maxDate!!) maxDate = date
-        }
-    }
-
-    private fun formatNumber(value: Double): String {
-        return if (value == value.toLong().toDouble()) {
-            "%,d".format(value.toLong())
-        } else {
-            "%.1f".format(value)
-        }
+        logger("Sending $totalCount items ($breakdown)")
     }
 
     // MARK: - Token Refresh
@@ -534,7 +481,7 @@ class SyncManager(
 
             val response = httpClient.newCall(request).execute()
             val responseBody = response.body?.string()
-            android.util.Log.d(TAG, "Token refresh response [${response.code}]: $responseBody")
+            android.util.Log.d(TAG, "Token refresh response [${response.code}]")
 
             if (response.isSuccessful && responseBody != null) {
                 val jsonObj = json.parseToJsonElement(responseBody).jsonObject
@@ -598,8 +545,7 @@ class SyncManager(
                 applyAuth(requestBuilder)
 
                 val response = httpClient.newCall(requestBuilder.build()).execute()
-                val responseBody = response.body?.string()
-                android.util.Log.d(TAG, "RESPONSE [${response.code}]:\n$responseBody")
+                android.util.Log.d(TAG, "RESPONSE [${response.code}]")
 
                 if (response.isSuccessful) return@withContext SendResult(true, response.code, sizeKb)
                 if (response.code == 401) {
@@ -632,8 +578,7 @@ class SyncManager(
                     applyAuth(retryBuilder, newCredential)
 
                     val retryResponse = httpClient.newCall(retryBuilder.build()).execute()
-                    val retryBody = retryResponse.body?.string()
-                    android.util.Log.d(TAG, "Retry RESPONSE [${retryResponse.code}]:\n$retryBody")
+                    android.util.Log.d(TAG, "Retry RESPONSE [${retryResponse.code}]")
 
                     if (retryResponse.isSuccessful) true
                     else { emitAuthError(401); false }
