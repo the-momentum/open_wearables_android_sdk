@@ -796,7 +796,6 @@ class HealthConnectManager(
                 TimeRangeFilter.before(Instant.now())
         }
 
-        logger("Reading sleep sessions (since: $sinceTimestamp, ascending: $ascending)")
         val response = client.readRecords(
             ReadRecordsRequest(
                 recordType = SleepSessionRecord::class,
@@ -805,7 +804,6 @@ class HealthConnectManager(
                 pageSize = limit
             )
         )
-        logger("Sleep query returned ${response.records.size} sessions")
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
 
         var maxTs: Long? = null
@@ -853,7 +851,6 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        logger("Total sleep entries: ${sleepEntries.size}")
         return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs)
     }
 

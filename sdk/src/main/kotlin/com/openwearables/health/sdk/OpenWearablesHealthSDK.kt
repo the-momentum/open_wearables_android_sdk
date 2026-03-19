@@ -163,6 +163,18 @@ class OpenWearablesHealthSDK private constructor(
         logMessage("Sync interval set to ${maxOf(minutes, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)} minutes")
     }
 
+    /**
+     * Customize the foreground notification shown during background sync.
+     *
+     * @param title Notification title (default: "Health Sync")
+     * @param text  Notification body text (default: "Syncing health data...")
+     */
+    fun setSyncNotification(title: String? = null, text: String? = null) {
+        title?.let { secureStorage.saveNotificationTitle(it) }
+        text?.let { secureStorage.saveNotificationText(it) }
+        logMessage("Sync notification updated: title=${title ?: "(unchanged)"}, text=${text ?: "(unchanged)"}")
+    }
+
     private suspend fun autoRestoreSync() {
         val h = host
         if (h == null || secureStorage.getUserId() == null || !secureStorage.hasAuth) {

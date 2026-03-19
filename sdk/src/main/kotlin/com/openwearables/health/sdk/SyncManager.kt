@@ -9,17 +9,13 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -32,7 +28,8 @@ data class TypeSyncProgress(
     val typeIdentifier: String,
     var sentCount: Int = 0,
     var isComplete: Boolean = false,
-    var pendingAnchorTimestamp: Long? = null
+    var pendingAnchorTimestamp: Long? = null,
+    var pendingOlderThan: Long? = null
 )
 
 @Serializable
@@ -66,8 +63,6 @@ class SyncManager(
     private val onAuthError: ((Int, String) -> Unit)? = null
 ) {
     companion object {
-        private const val TAG = "SyncManager"
-
         val sharedHttpClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(30, TimeUnit.SECONDS)
@@ -82,7 +77,6 @@ class SyncManager(
     }
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val prettyJson = Json { prettyPrint = true; ignoreUnknownKeys = true }
 
     private val httpClient = sharedHttpClient
 
@@ -130,11 +124,14 @@ class SyncManager(
 
     // MARK: - Auth
 
+    private fun bearerValue(token: String): String =
+        if (token.startsWith("Bearer ")) token else "Bearer $token"
+
     private fun applyAuth(requestBuilder: Request.Builder) {
         val accessToken = secureStorage.getAccessToken()
         val apiKey = secureStorage.getApiKey()
         if (accessToken != null) {
-            requestBuilder.header("Authorization", accessToken)
+            requestBuilder.header("Authorization", bearerValue(accessToken))
         } else if (apiKey != null) {
             requestBuilder.header("X-Open-Wearables-API-Key", apiKey)
         }
@@ -144,7 +141,7 @@ class SyncManager(
         if (secureStorage.isApiKeyAuth) {
             requestBuilder.header("X-Open-Wearables-API-Key", credential)
         } else {
-            requestBuilder.header("Authorization", credential)
+            requestBuilder.header("Authorization", bearerValue(credential))
         }
     }
 
@@ -159,7 +156,7 @@ class SyncManager(
 
     suspend fun startBackgroundSync(host: String, customSyncUrl: String?): Boolean {
         schedulePeriodicSync(host, customSyncUrl)
-        syncNow(host, customSyncUrl, fullExport = !hasCompletedInitialSync())
+        scheduleExpeditedSync(host, customSyncUrl)
         return true
     }
 
@@ -240,10 +237,8 @@ class SyncManager(
             val floor = syncStartTimestamp()
             val floorLabel = if (floor != null) "since ${java.time.Instant.ofEpochMilli(floor)}" else "full history"
 
-            val startIndex: Int
             if (isResuming) {
                 logger("Sync: resuming (${existingState!!.totalSentCount} sent, ${existingState.completedTypes.size}/${trackedTypes.size} types done, $floorLabel)")
-                startIndex = existingState.currentTypeIndex
                 stateMutex.withLock { inMemoryState = existingState }
             } else {
                 val mode = if (fullExport) "full export" else "incremental"
@@ -255,41 +250,120 @@ class SyncManager(
                     )
                     persistStateToDisk()
                 }
-                startIndex = 0
             }
 
-            processTypes(trackedTypes, startIndex, fullExport, endpoint)
+            processTypesRoundRobin(trackedTypes, fullExport, endpoint)
         } finally {
             isSyncing.set(false)
         }
     }
 
-    private suspend fun processTypes(
+    // MARK: - Round-Robin Sync Orchestration (combined payloads)
+
+    private data class FetchResult(
+        val type: String,
+        val data: UnifiedHealthData = UnifiedHealthData(),
+        val count: Int = 0,
+        val nextCursor: Long? = null,
+        val anchorTimestamp: Long? = null,
+        val isDone: Boolean = false
+    )
+
+    private suspend fun processTypesRoundRobin(
         types: List<String>,
-        startIndex: Int,
         fullExport: Boolean,
         endpoint: String
     ) {
-        for (i in startIndex until types.size) {
-            val type = types[i]
+        val olderThanCursors = mutableMapOf<String, Long?>()
+        val anchorCursors = mutableMapOf<String, Long?>()
+        val completedTypes = mutableSetOf<String>()
 
-            val alreadySynced = stateMutex.withLock {
-                inMemoryState?.completedTypes?.contains(type) == true
+        stateMutex.withLock {
+            val state = inMemoryState
+            if (state != null) {
+                completedTypes.addAll(state.completedTypes)
+                for ((id, progress) in state.typeProgress) {
+                    if (!progress.isComplete) {
+                        progress.pendingOlderThan?.let { olderThanCursors[id] = it }
+                        progress.pendingAnchorTimestamp?.let { anchorCursors[id] = it }
+                    }
+                }
             }
-            if (alreadySynced) {
-                logger("Skipping $type - already synced")
-                continue
+        }
+
+        if (!fullExport) {
+            val anchors = loadAnchors()
+            val floor = syncStartTimestamp()
+            for (type in types) {
+                if (!completedTypes.contains(type) && !anchorCursors.containsKey(type)) {
+                    val storedAnchor = anchors[type]
+                    val anchor = when {
+                        storedAnchor != null && floor != null -> maxOf(storedAnchor, floor)
+                        storedAnchor != null -> storedAnchor
+                        else -> floor
+                    }
+                    anchorCursors[type] = anchor
+                }
+            }
+        }
+
+        while (true) {
+            val incompleteTypes = types.filter { !completedTypes.contains(it) }
+            if (incompleteTypes.isEmpty()) break
+
+            val perTypeLimit = maxOf(1, SyncDefaults.CHUNK_SIZE / incompleteTypes.size)
+
+            // Phase 1: Fetch one chunk from each type (no network yet)
+            val roundResults = mutableListOf<FetchResult>()
+
+            for (type in incompleteTypes) {
+                val result = if (fullExport) {
+                    fetchOneChunkNewestFirst(type, olderThanCursors[type], perTypeLimit)
+                } else {
+                    fetchOneChunkIncremental(type, anchorCursors[type], perTypeLimit)
+                }
+
+                roundResults.add(result)
+
+                if (result.isDone) {
+                    completedTypes.add(type)
+                } else {
+                    if (fullExport) olderThanCursors[type] = result.nextCursor
+                    else anchorCursors[type] = result.nextCursor
+                }
             }
 
+            // Phase 2: Merge all fetched data into one combined payload
+            val mergedData = UnifiedHealthData(
+                records = roundResults.flatMap { it.data.records },
+                workouts = roundResults.flatMap { it.data.workouts },
+                sleep = roundResults.flatMap { it.data.sleep }
+            )
+
+            if (!mergedData.isEmpty) {
+                val payload = buildPayload(mergedData)
+                logPayloadSummary(mergedData)
+                val sendResult = sendPayload(endpoint, payload)
+
+                if (!sendResult.success) {
+                    val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
+                    logger("Combined round failed ($reason)")
+                    stateMutex.withLock { persistStateToDisk() }
+                    return
+                }
+
+                logger("Round sent: ${mergedData.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+            }
+
+            // Phase 3: Update progress for all types in this round
             stateMutex.withLock {
-                inMemoryState?.currentTypeIndex = i
-            }
-
-            val success = processType(type, fullExport, endpoint)
-            if (!success) {
-                logger("Sync paused at $type, will resume later")
-                stateMutex.withLock { persistStateToDisk() }
-                return
+                for (result in roundResults) {
+                    updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp)
+                    if (fullExport && !result.isDone) {
+                        inMemoryState?.typeProgress?.get(result.type)?.pendingOlderThan = result.nextCursor
+                    }
+                }
+                persistStateToDisk()
             }
         }
 
@@ -301,115 +375,70 @@ class SyncManager(
         }
     }
 
-    private suspend fun processType(type: String, fullExport: Boolean, endpoint: String): Boolean {
-        if (fullExport) {
-            return processTypeNewestFirst(type, endpoint)
-        }
+    // MARK: - Fetch-Only Chunk Processors (no network)
 
-        val anchors = loadAnchors()
-        val storedAnchor = anchors[type]
-        val floor = syncStartTimestamp()
-        val anchor = when {
-            storedAnchor != null && floor != null -> maxOf(storedAnchor, floor)
-            storedAnchor != null -> storedAnchor
-            else -> floor
-        }
-
-        logger("  $type: querying...")
-
-        val result = healthProvider.readData(type, anchor, SyncDefaults.CHUNK_SIZE)
-
-        if (result.data.isEmpty) {
-            logger("  $type: no new data")
-            stateMutex.withLock {
-                updateInMemoryProgress(type, 0, isComplete = true, anchorTimestamp = null)
-            }
-            return true
-        }
-
-        val count = result.data.totalCount
-        val payload = buildPayload(result.data)
-        logPayloadSummary(result.data)
-        val sendResult = sendPayload(endpoint, payload)
-
-        if (sendResult.success) {
-            stateMutex.withLock {
-                updateInMemoryProgress(type, count, isComplete = true, anchorTimestamp = result.maxTimestamp)
-                persistStateToDisk()
-            }
-            logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
-            return true
-        } else {
-            val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
-            logger("  $type: $count items -> failed ($reason)")
-            return false
-        }
-    }
-
-    /**
-     * Full-export: fetch data newest-first in chunks. Uses a while loop
-     * instead of recursion to avoid continuation chain buildup on large datasets.
-     */
-    private suspend fun processTypeNewestFirst(
+    private suspend fun fetchOneChunkNewestFirst(
         type: String,
-        endpoint: String
-    ): Boolean {
-        var olderThan: Long? = null
+        olderThan: Long?,
+        limit: Int
+    ): FetchResult {
         val floor = syncStartTimestamp()
         val floorIso = floor?.let { UnifiedTimestamp.fromEpochMs(it) }
 
-        while (true) {
-            logger("  $type: querying (newest first${olderThan?.let { ", olderThan=${java.time.Instant.ofEpochMilli(it)}" } ?: ""})...")
+        logger("  $type: querying (newest first, limit=$limit${olderThan?.let { ", olderThan=${java.time.Instant.ofEpochMilli(it)}" } ?: ""})...")
 
-            val result = healthProvider.readDataDescending(type, olderThan, SyncDefaults.CHUNK_SIZE)
+        val result = healthProvider.readDataDescending(type, olderThan, limit)
 
-            if (result.data.isEmpty) {
-                logger("  $type: all data sent (newest first)")
-                stateMutex.withLock {
-                    updateInMemoryProgress(type, 0, isComplete = true, anchorTimestamp = null)
-                    persistStateToDisk()
-                }
-                return true
-            }
-
-            val reachedFloor = floor != null && result.minTimestamp != null && result.minTimestamp <= floor
-            val isLastChunk = result.data.totalCount < SyncDefaults.CHUNK_SIZE || reachedFloor
-
-            val data = if (reachedFloor && floorIso != null) result.data.filterSince(floorIso) else result.data
-
-            if (data.isEmpty) {
-                logger("  $type: all data within range sent")
-                stateMutex.withLock {
-                    updateInMemoryProgress(type, 0, isComplete = true, anchorTimestamp = null)
-                    persistStateToDisk()
-                }
-                return true
-            }
-
-            val count = data.totalCount
-            val payload = buildPayload(data)
-            logPayloadSummary(data)
-            val sendResult = sendPayload(endpoint, payload)
-
-            if (!sendResult.success) {
-                val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
-                logger("  $type: $count items -> failed ($reason)")
-                return false
-            }
-
-            val anchorTs = if (olderThan == null) result.maxTimestamp else null
-
-            logger("  $type: $count items sent (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}${if (reachedFloor) " [reached sync boundary]" else ""}")
-
-            stateMutex.withLock {
-                updateInMemoryProgress(type, count, isComplete = isLastChunk, anchorTimestamp = anchorTs)
-                if (isLastChunk) persistStateToDisk()
-            }
-
-            if (isLastChunk) return true
-
-            olderThan = result.minTimestamp
+        if (result.data.isEmpty) {
+            logger("  $type: all data sent (newest first)")
+            return FetchResult(type = type, isDone = true)
         }
+
+        val reachedFloor = floor != null && result.minTimestamp != null && result.minTimestamp <= floor
+        val isLastChunk = result.data.totalCount < limit || reachedFloor
+
+        val data = if (reachedFloor && floorIso != null) result.data.filterSince(floorIso) else result.data
+
+        if (data.isEmpty) {
+            logger("  $type: all data within range sent")
+            return FetchResult(type = type, isDone = true)
+        }
+
+        val anchorTs = if (olderThan == null) result.maxTimestamp else null
+        val nextOlderThan = if (isLastChunk) null else result.minTimestamp
+
+        logger("  $type: ${data.totalCount} samples (newest first)")
+
+        return FetchResult(
+            type = type, data = data, count = data.totalCount,
+            nextCursor = nextOlderThan, anchorTimestamp = anchorTs, isDone = isLastChunk
+        )
+    }
+
+    private suspend fun fetchOneChunkIncremental(
+        type: String,
+        anchor: Long?,
+        limit: Int
+    ): FetchResult {
+        logger("  $type: querying (limit=$limit)...")
+
+        val result = healthProvider.readData(type, anchor, limit)
+
+        if (result.data.isEmpty) {
+            logger("  $type: no new data")
+            return FetchResult(type = type, isDone = true)
+        }
+
+        val count = result.data.totalCount
+        val isLastChunk = count < limit
+
+        logger("  $type: $count samples")
+
+        return FetchResult(
+            type = type, data = result.data, count = count,
+            nextCursor = result.maxTimestamp, anchorTimestamp = result.maxTimestamp,
+            isDone = isLastChunk
+        )
     }
 
     private fun updateInMemoryProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Boolean, anchorTimestamp: Long?) {
@@ -465,11 +494,10 @@ class SyncManager(
             val refreshToken = secureStorage.getRefreshToken()
             val apiBaseUrl = secureStorage.apiBaseUrl
             if (refreshToken == null || apiBaseUrl == null) {
-                android.util.Log.w(TAG, "No refresh token or host - cannot refresh")
+                logger("Token refresh: missing credentials")
                 return@withContext false
             }
 
-            android.util.Log.d(TAG, "Attempting token refresh...")
             val url = "$apiBaseUrl/token/refresh"
             val bodyMap = mapOf("refresh_token" to refreshToken)
             val body = json.encodeToString(bodyMap)
@@ -481,23 +509,24 @@ class SyncManager(
 
             val response = httpClient.newCall(request).execute()
             val responseBody = response.body?.string()
-            android.util.Log.d(TAG, "Token refresh response [${response.code}]")
 
             if (response.isSuccessful && responseBody != null) {
                 val jsonObj = json.parseToJsonElement(responseBody).jsonObject
                 val newAccessToken = jsonObj["access_token"]?.jsonPrimitive?.contentOrNull
+                val newRefreshToken = jsonObj["refresh_token"]?.jsonPrimitive?.contentOrNull
                 if (newAccessToken != null) {
-                    val newRefreshToken = jsonObj["refresh_token"]?.jsonPrimitive?.contentOrNull
                     secureStorage.updateTokens(newAccessToken, newRefreshToken)
-                    logger("Token refreshed")
+                    logger("Token refresh: HTTP ${response.code}")
                     return@withContext true
+                } else {
+                    logger("Token refresh failed: HTTP ${response.code} (no access_token in response)")
                 }
+            } else {
+                logger("Token refresh failed: HTTP ${response.code}")
             }
-            logger("Token refresh failed (HTTP ${response.code})")
             false
         } catch (e: Exception) {
-            android.util.Log.e(TAG, "Token refresh error", e)
-            logger("Token refresh failed")
+            logger("Token refresh failed: ${e.javaClass.simpleName}: ${e.message}")
             false
         } finally {
             tokenRefreshLock.withLock { isRefreshingToken = false }
@@ -509,58 +538,85 @@ class SyncManager(
     private data class SendResult(val success: Boolean, val statusCode: Int?, val payloadSizeKb: Int)
 
     private suspend fun sendPayload(endpoint: String, payload: Map<String, Any>): SendResult {
-        val jsonBody = serializePayload(payload)
-        return sendPayloadRaw(endpoint, jsonBody)
+        val body = streamingJsonBody(payload)
+        return sendWithBody(endpoint, body)
     }
 
-    private fun serializePayload(payload: Map<String, Any>): String {
-        val element = mapToJsonElement(payload)
-        return json.encodeToString(JsonElement.serializer(), element)
-    }
-
-    private fun mapToJsonElement(value: Any?): JsonElement {
-        return when (value) {
-            null -> JsonNull
-            is Boolean -> JsonPrimitive(value)
-            is Number -> JsonPrimitive(value)
-            is String -> JsonPrimitive(value)
-            is Map<*, *> -> JsonObject(
-                value.entries.associate { (k, v) -> k.toString() to mapToJsonElement(v) }
-            )
-            is List<*> -> JsonArray(value.map { mapToJsonElement(it) })
-            else -> JsonPrimitive(value.toString())
+    /**
+     * Creates an OkHttp RequestBody that streams JSON directly from the Map
+     * to the network via android.util.JsonWriter. No intermediate JsonElement
+     * tree or full String is allocated — only the writer's small internal buffer
+     * is held in heap, making memory usage O(depth) instead of O(n).
+     */
+    private fun streamingJsonBody(payload: Map<String, Any>): RequestBody {
+        return object : okhttp3.RequestBody() {
+            override fun contentType() = "application/json".toMediaType()
+            override fun writeTo(sink: okio.BufferedSink) {
+                val writer = android.util.JsonWriter(
+                    java.io.OutputStreamWriter(sink.outputStream(), Charsets.UTF_8)
+                )
+                writeValue(writer, payload)
+                writer.flush()
+            }
         }
     }
 
-    private suspend fun sendPayloadRaw(endpoint: String, jsonBody: String): SendResult =
+    private fun writeValue(writer: android.util.JsonWriter, value: Any?) {
+        when (value) {
+            null -> writer.nullValue()
+            is Boolean -> writer.value(value)
+            is Int -> writer.value(value.toLong())
+            is Long -> writer.value(value)
+            is Float -> writer.value(value.toDouble())
+            is Double -> writer.value(value)
+            is Number -> writer.value(value.toDouble())
+            is String -> writer.value(value)
+            is Map<*, *> -> {
+                writer.beginObject()
+                for ((k, v) in value) {
+                    writer.name(k.toString())
+                    writeValue(writer, v)
+                }
+                writer.endObject()
+            }
+            is List<*> -> {
+                writer.beginArray()
+                for (item in value) {
+                    writeValue(writer, item)
+                }
+                writer.endArray()
+            }
+            else -> writer.value(value.toString())
+        }
+    }
+
+    private suspend fun sendWithBody(endpoint: String, body: okhttp3.RequestBody): SendResult =
         withContext(dispatchers.io) {
             try {
-                val sizeKb = jsonBody.length / 1024
-                android.util.Log.d(TAG, "REQUEST [$endpoint] (${sizeKb} KB)")
-
                 val requestBuilder = Request.Builder()
                     .url(endpoint)
-                    .post(jsonBody.toRequestBody("application/json".toMediaType()))
+                    .post(body)
                     .header("Content-Type", "application/json")
                 applyAuth(requestBuilder)
 
                 val response = httpClient.newCall(requestBuilder.build()).execute()
-                android.util.Log.d(TAG, "RESPONSE [${response.code}]")
+                val sizeKb = (response.header("Content-Length")?.toLongOrNull() ?: 0L) / 1024
 
-                if (response.isSuccessful) return@withContext SendResult(true, response.code, sizeKb)
+                if (response.isSuccessful) return@withContext SendResult(true, response.code, sizeKb.toInt())
                 if (response.code == 401) {
-                    val retryOk = handle401(endpoint, jsonBody)
-                    return@withContext SendResult(retryOk, if (retryOk) 200 else 401, sizeKb)
+                    logger("Got 401, refreshing token...")
+                    val retryOk = handle401(endpoint, body)
+                    return@withContext SendResult(retryOk, if (retryOk) 200 else 401, sizeKb.toInt())
                 }
 
-                SendResult(false, response.code, sizeKb)
+                SendResult(false, response.code, sizeKb.toInt())
             } catch (e: Exception) {
-                android.util.Log.e(TAG, "Upload error", e)
+                logger("Upload error: ${e.javaClass.simpleName}: ${e.message}")
                 SendResult(false, null, 0)
             }
         }
 
-    private suspend fun handle401(endpoint: String, jsonBody: String): Boolean {
+    private suspend fun handle401(endpoint: String, body: okhttp3.RequestBody): Boolean {
         if (secureStorage.isApiKeyAuth) {
             emitAuthError(401)
             return false
@@ -569,21 +625,24 @@ class SyncManager(
         if (attemptTokenRefresh()) {
             val newCredential = secureStorage.authCredential
             if (newCredential != null) {
-                android.util.Log.d(TAG, "Retrying upload with refreshed token...")
+                logger("Token refreshed, retrying...")
                 return try {
                     val retryBuilder = Request.Builder()
                         .url(endpoint)
-                        .post(jsonBody.toRequestBody("application/json".toMediaType()))
+                        .post(body)
                         .header("Content-Type", "application/json")
                     applyAuth(retryBuilder, newCredential)
 
                     val retryResponse = httpClient.newCall(retryBuilder.build()).execute()
-                    android.util.Log.d(TAG, "Retry RESPONSE [${retryResponse.code}]")
-
-                    if (retryResponse.isSuccessful) true
-                    else { emitAuthError(401); false }
+                    if (retryResponse.isSuccessful) {
+                        logger("Retry: HTTP ${retryResponse.code}")
+                        true
+                    } else {
+                        logger("Retry failed: HTTP ${retryResponse.code}")
+                        emitAuthError(401); false
+                    }
                 } catch (e: Exception) {
-                    android.util.Log.e(TAG, "Retry failed", e)
+                    logger("Retry failed: ${e.message}")
                     emitAuthError(401); false
                 }
             }
@@ -621,10 +680,9 @@ class SyncManager(
     private fun saveAnchor(type: String, timestamp: Long) {
         val current = loadAnchors().toMutableMap()
         current[type] = timestamp
-        val element = mapToJsonElement(current)
         syncPrefs.edit().putString(
             StorageKeys.KEY_ANCHORS,
-            json.encodeToString(JsonElement.serializer(), element)
+            json.encodeToString(current.mapValues { it.value.toDouble() })
         ).apply()
     }
 

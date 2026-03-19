@@ -16,7 +16,7 @@ object SyncDefaults {
     const val CHUNK_SIZE = 2000
     const val WORK_NAME_PERIODIC = "health_sync_periodic"
     const val WORK_NAME_EXPEDITED = "health_sync_expedited"
-    const val SDK_VERSION = "0.6.0"
+    const val SDK_VERSION = "0.7.0"
 }
 
 object StorageKeys {
@@ -31,4 +31,5 @@ object NotificationConfig {
     const val CHANNEL_ID = "health_sync_channel"
     const val CHANNEL_NAME = "Health Sync"
     const val CHANNEL_DESCRIPTION = "Background health data synchronization"
+    const val DEFAULT_TEXT = "Syncing health data..."
 }
