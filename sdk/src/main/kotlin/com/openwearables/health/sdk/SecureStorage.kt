@@ -34,6 +34,8 @@ class SecureStorage(private val context: Context) {
         private const val KEY_HEALTH_PROVIDER = "healthProvider"
         private const val KEY_APP_INSTALLED = "appInstalled"
         private const val KEY_SYNC_DAYS_BACK = "syncDaysBack"
+        private const val KEY_NOTIFICATION_TITLE = "notificationTitle"
+        private const val KEY_NOTIFICATION_TEXT = "notificationText"
     }
 
     /**
@@ -193,11 +195,28 @@ class SecureStorage(private val context: Context) {
     // MARK: - Tracked Types
 
     fun saveTrackedTypes(types: List<String>) {
-        configPrefs.edit().putStringSet(KEY_TRACKED_TYPES, types.toSet()).apply()
+        val json = org.json.JSONArray(types).toString()
+        configPrefs.edit()
+            .remove(KEY_TRACKED_TYPES)
+            .putString(KEY_TRACKED_TYPES, json)
+            .apply()
     }
 
     fun getTrackedTypes(): List<String> {
-        return configPrefs.getStringSet(KEY_TRACKED_TYPES, emptySet())?.toList() ?: emptyList()
+        try {
+            val jsonStr = configPrefs.getString(KEY_TRACKED_TYPES, null)
+            if (jsonStr != null && jsonStr.startsWith("[")) {
+                val arr = org.json.JSONArray(jsonStr)
+                return (0 until arr.length()).map { arr.getString(it) }
+            }
+        } catch (_: ClassCastException) {
+            // Legacy StringSet format - fall through
+        } catch (_: Exception) { }
+        return try {
+            configPrefs.getStringSet(KEY_TRACKED_TYPES, emptySet())?.sorted() ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     // MARK: - Sync Days Back
@@ -217,6 +236,22 @@ class SecureStorage(private val context: Context) {
 
     fun getProvider(): String? = configPrefs.getString(KEY_HEALTH_PROVIDER, null)
 
+    // MARK: - Notification
+
+    fun saveNotificationTitle(title: String) {
+        configPrefs.edit().putString(KEY_NOTIFICATION_TITLE, title).apply()
+    }
+
+    fun saveNotificationText(text: String) {
+        configPrefs.edit().putString(KEY_NOTIFICATION_TEXT, text).apply()
+    }
+
+    fun getNotificationTitle(): String = configPrefs.getString(KEY_NOTIFICATION_TITLE, null)
+        ?: NotificationConfig.CHANNEL_NAME
+
+    fun getNotificationText(): String = configPrefs.getString(KEY_NOTIFICATION_TEXT, null)
+        ?: NotificationConfig.DEFAULT_TEXT
+
     // MARK: - API Base URL (derived from host)
 
     val apiBaseUrl: String?
@@ -229,8 +264,17 @@ class SecureStorage(private val context: Context) {
     // MARK: - Clear
 
     fun clearAll() {
-        securePrefs.edit().clear().apply()
-        configPrefs.edit().clear().apply()
-        configPrefs.edit().putBoolean(KEY_APP_INSTALLED, true).apply()
+        // Remove credential keys individually — EncryptedSharedPreferences.clear()
+        // has a known Android bug where it can leave orphan encrypted entries,
+        // causing hasSession() to return stale data after sign-out.
+        securePrefs.edit()
+            .remove(KEY_ACCESS_TOKEN)
+            .remove(KEY_REFRESH_TOKEN)
+            .remove(KEY_USER_ID)
+            .remove(KEY_API_KEY)
+            .commit()
+
+        configPrefs.edit().clear().commit()
+        configPrefs.edit().putBoolean(KEY_APP_INSTALLED, true).commit()
     }
 }

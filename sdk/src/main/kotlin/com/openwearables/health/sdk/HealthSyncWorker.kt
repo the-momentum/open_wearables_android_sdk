@@ -25,7 +25,6 @@ class HealthSyncWorker(
 
         try {
             setForeground(getForegroundInfo())
-            android.util.Log.d("HealthSyncWorker", "Running as foreground service")
         } catch (e: Exception) {
             android.util.Log.w("HealthSyncWorker", "Could not promote to foreground: ${e.message}")
         }
@@ -67,9 +66,10 @@ class HealthSyncWorker(
 
     override suspend fun getForegroundInfo(): ForegroundInfo {
         createNotificationChannel()
+        val secureStorage = SecureStorage(applicationContext)
         val notification = androidx.core.app.NotificationCompat.Builder(applicationContext, NotificationConfig.CHANNEL_ID)
-            .setContentTitle(NotificationConfig.CHANNEL_NAME)
-            .setContentText("Syncing health data...")
+            .setContentTitle(secureStorage.getNotificationTitle())
+            .setContentText(secureStorage.getNotificationText())
             .setSmallIcon(android.R.drawable.ic_popup_sync)
             .setPriority(androidx.core.app.NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
