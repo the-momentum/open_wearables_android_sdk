@@ -75,7 +75,7 @@ class HealthSyncWorker(
             .setOngoing(true)
             .build()
         return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            ForegroundInfo(NotificationConfig.NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            ForegroundInfo(NotificationConfig.NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
         } else {
             ForegroundInfo(NotificationConfig.NOTIFICATION_ID, notification)
         }
