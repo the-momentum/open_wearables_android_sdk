@@ -488,14 +488,18 @@ class SyncManager(
 
     // MARK: - Token Refresh
 
-    private suspend fun attemptTokenRefresh(): Boolean = withContext(dispatchers.io) {
+    private enum class TokenRefreshResult {
+        SUCCESS, AUTH_FAILURE, NETWORK_ERROR
+    }
+
+    private suspend fun attemptTokenRefresh(): TokenRefreshResult = withContext(dispatchers.io) {
         tokenRefreshLock.withLock { isRefreshingToken = true }
         try {
             val refreshToken = secureStorage.getRefreshToken()
             val apiBaseUrl = secureStorage.apiBaseUrl
             if (refreshToken == null || apiBaseUrl == null) {
                 logger("Token refresh: missing credentials")
-                return@withContext false
+                return@withContext TokenRefreshResult.AUTH_FAILURE
             }
 
             val url = "$apiBaseUrl/token/refresh"
@@ -510,6 +514,11 @@ class SyncManager(
             val response = httpClient.newCall(request).execute()
             val responseBody = response.body?.string()
 
+            if (response.code in 401..403) {
+                logger("Token refresh rejected: HTTP ${response.code}")
+                return@withContext TokenRefreshResult.AUTH_FAILURE
+            }
+
             if (response.isSuccessful && responseBody != null) {
                 val jsonObj = json.parseToJsonElement(responseBody).jsonObject
                 val newAccessToken = jsonObj["access_token"]?.jsonPrimitive?.contentOrNull
@@ -517,17 +526,17 @@ class SyncManager(
                 if (newAccessToken != null) {
                     secureStorage.updateTokens(newAccessToken, newRefreshToken)
                     logger("Token refresh: HTTP ${response.code}")
-                    return@withContext true
+                    return@withContext TokenRefreshResult.SUCCESS
                 } else {
                     logger("Token refresh failed: HTTP ${response.code} (no access_token in response)")
                 }
             } else {
                 logger("Token refresh failed: HTTP ${response.code}")
             }
-            false
+            TokenRefreshResult.NETWORK_ERROR
         } catch (e: Exception) {
             logger("Token refresh failed: ${e.javaClass.simpleName}: ${e.message}")
-            false
+            TokenRefreshResult.NETWORK_ERROR
         } finally {
             tokenRefreshLock.withLock { isRefreshingToken = false }
         }
@@ -622,33 +631,43 @@ class SyncManager(
             return false
         }
 
-        if (attemptTokenRefresh()) {
-            val newCredential = secureStorage.authCredential
-            if (newCredential != null) {
-                logger("Token refreshed, retrying...")
-                return try {
-                    val retryBuilder = Request.Builder()
-                        .url(endpoint)
-                        .post(body)
-                        .header("Content-Type", "application/json")
-                    applyAuth(retryBuilder, newCredential)
+        when (attemptTokenRefresh()) {
+            TokenRefreshResult.SUCCESS -> {
+                val newCredential = secureStorage.authCredential
+                if (newCredential != null) {
+                    logger("Token refreshed, retrying...")
+                    return try {
+                        val retryBuilder = Request.Builder()
+                            .url(endpoint)
+                            .post(body)
+                            .header("Content-Type", "application/json")
+                        applyAuth(retryBuilder, newCredential)
 
-                    val retryResponse = httpClient.newCall(retryBuilder.build()).execute()
-                    if (retryResponse.isSuccessful) {
-                        logger("Retry: HTTP ${retryResponse.code}")
-                        true
-                    } else {
-                        logger("Retry failed: HTTP ${retryResponse.code}")
-                        emitAuthError(401); false
+                        val retryResponse = httpClient.newCall(retryBuilder.build()).execute()
+                        if (retryResponse.isSuccessful) {
+                            logger("Retry: HTTP ${retryResponse.code}")
+                            true
+                        } else {
+                            logger("Retry failed: HTTP ${retryResponse.code}")
+                            if (retryResponse.code in 401..403) emitAuthError(401)
+                            false
+                        }
+                    } catch (e: Exception) {
+                        logger("Retry failed: ${e.message}")
+                        false
                     }
-                } catch (e: Exception) {
-                    logger("Retry failed: ${e.message}")
-                    emitAuthError(401); false
                 }
+                return false
+            }
+            TokenRefreshResult.AUTH_FAILURE -> {
+                emitAuthError(401)
+                return false
+            }
+            TokenRefreshResult.NETWORK_ERROR -> {
+                logger("Token refresh failed (network) - will retry later")
+                return false
             }
         }
-        emitAuthError(401)
-        return false
     }
 
     // MARK: - Sync Endpoint
