@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.0
+
+* **Sync telemetry**: new `/logs` endpoint integration for initial full sync diagnostics.
+  - `historical_data_sync_start` event sent before the first payload with per-type record counts, time range, and device state.
+  - `historical_data_type_sync_end` event sent per data type as each completes, with record count, duration, success status, and device state snapshot.
+  - Device state includes battery level/state, thermal state, low power mode, and RAM usage.
+  - Types with zero records are excluded from end events.
+  - Type names in logs now match payload record types (e.g. `STEP_COUNT`, `HEART_RATE`).
+* **Auto full export on first sync**: `syncNow` now automatically upgrades to full export when the initial sync hasn't been completed, matching iOS behavior.
+* **Fixed OkHttp connection leaks**: response bodies are now properly closed in sync payload uploads, token refresh retries, and log requests.
+
 ## 0.9.0
 
 * **Smarter token refresh error handling**: token refresh failures are now classified as either `AUTH_FAILURE` (refresh token rejected with 401/403) or `NETWORK_ERROR` (timeout, DNS, 5xx). Only genuine auth failures trigger user disconnect — transient network errors during refresh no longer force sign-out, allowing the SDK's retry mechanism to recover automatically.
