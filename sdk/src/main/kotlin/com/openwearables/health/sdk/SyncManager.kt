@@ -91,6 +91,9 @@ class SyncManager(
     private val stateMutex = Mutex()
     private var inMemoryState: SyncState? = null
 
+    private var fullSyncStartTime: Long? = null
+    private var currentLogsEndpoint: String? = null
+
     var syncIntervalMinutes: Long = SyncDefaults.SYNC_INTERVAL_MINUTES
         set(value) {
             field = maxOf(value, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)
@@ -237,28 +240,62 @@ class SyncManager(
             val floor = syncStartTimestamp()
             val floorLabel = if (floor != null) "since ${java.time.Instant.ofEpochMilli(floor)}" else "full history"
 
+            val effectiveFullExport: Boolean
             if (isResuming) {
-                logger("Sync: resuming (${existingState!!.totalSentCount} sent, ${existingState.completedTypes.size}/${trackedTypes.size} types done, $floorLabel)")
+                effectiveFullExport = existingState!!.fullExport
+                logger("Sync: resuming (${existingState.totalSentCount} sent, ${existingState.completedTypes.size}/${trackedTypes.size} types done, $floorLabel)")
                 stateMutex.withLock { inMemoryState = existingState }
             } else {
-                val mode = if (fullExport) "full export" else "incremental"
+                effectiveFullExport = fullExport || !hasCompletedInitialSync()
+                val mode = if (effectiveFullExport) "full export" else "incremental"
                 logger("Sync: starting ($mode, ${trackedTypes.size} types, ${healthProvider.providerName}, $floorLabel)")
                 stateMutex.withLock {
                     inMemoryState = SyncState(
-                        userKey = userKey(), fullExport = fullExport,
+                        userKey = userKey(), fullExport = effectiveFullExport,
                         createdAt = System.currentTimeMillis()
                     )
                     persistStateToDisk()
                 }
             }
 
-            processTypesRoundRobin(trackedTypes, fullExport, endpoint)
+            val syncStartTime = System.currentTimeMillis()
+            val logsEndpoint = buildLogsEndpoint(host, userId)
+
+            if (effectiveFullExport) {
+                fullSyncStartTime = syncStartTime
+                currentLogsEndpoint = logsEndpoint
+                try {
+                    logger("Counting records for sync start log...")
+                    val typeCounts = countRecordsForTypes(trackedTypes, floor)
+                    logger("Sending sync start log to $logsEndpoint")
+                    sendSyncStartLog(logsEndpoint, trackedTypes, typeCounts, floor)
+                } catch (e: Exception) {
+                    logger("Sync start log failed: ${e.message}")
+                }
+            }
+
+            val result = processTypesRoundRobin(trackedTypes, effectiveFullExport, endpoint)
+
+            if (effectiveFullExport && !result.completed) {
+                val durationMs = (System.currentTimeMillis() - syncStartTime).toInt()
+                for (typeResult in result.typeResults) {
+                    if (!typeResult.success && typeResult.recordCount > 0) {
+                        sendTypeEndLog(logsEndpoint, typeResult.type, false, typeResult.recordCount, durationMs)
+                    }
+                }
+            }
+
+            fullSyncStartTime = null
+            currentLogsEndpoint = null
         } finally {
             isSyncing.set(false)
         }
     }
 
     // MARK: - Round-Robin Sync Orchestration (combined payloads)
+
+    private data class TypeResult(val type: String, val success: Boolean, val recordCount: Int)
+    private data class RoundRobinResult(val completed: Boolean, val totalRecords: Int, val typeResults: List<TypeResult>)
 
     private data class FetchResult(
         val type: String,
@@ -273,7 +310,7 @@ class SyncManager(
         types: List<String>,
         fullExport: Boolean,
         endpoint: String
-    ) {
+    ): RoundRobinResult {
         val olderThanCursors = mutableMapOf<String, Long?>()
         val anchorCursors = mutableMapOf<String, Long?>()
         val completedTypes = mutableSetOf<String>()
@@ -348,31 +385,65 @@ class SyncManager(
                 if (!sendResult.success) {
                     val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
                     logger("Combined round failed ($reason)")
-                    stateMutex.withLock { persistStateToDisk() }
-                    return
+                    val (totalSent, typeResults) = stateMutex.withLock {
+                        persistStateToDisk()
+                        val state = inMemoryState
+                        val sent = state?.totalSentCount ?: 0
+                        val results = types.map { type ->
+                            TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
+                        }
+                        Pair(sent, results)
+                    }
+                    return RoundRobinResult(false, totalSent, typeResults)
                 }
 
                 logger("Round sent: ${mergedData.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
             }
 
             // Phase 3: Update progress for all types in this round
+            val newlyCompletedTypes = mutableListOf<Pair<String, Int>>()
             stateMutex.withLock {
                 for (result in roundResults) {
                     updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp)
                     if (fullExport && !result.isDone) {
                         inMemoryState?.typeProgress?.get(result.type)?.pendingOlderThan = result.nextCursor
                     }
+                    if (result.isDone) {
+                        newlyCompletedTypes.add(result.type to (inMemoryState?.typeProgress?.get(result.type)?.sentCount ?: 0))
+                    }
                 }
                 persistStateToDisk()
             }
+
+            val startTime = fullSyncStartTime
+            val logEndpoint = currentLogsEndpoint
+            if (fullExport && startTime != null && logEndpoint != null && newlyCompletedTypes.isNotEmpty()) {
+                for ((type, count) in newlyCompletedTypes) {
+                    if (count > 0) {
+                        val durationMs = (System.currentTimeMillis() - startTime).toInt()
+                        logger("Sending sync end log: ${payloadTypeName(type)} ($count records, ${durationMs}ms)")
+                        try {
+                            sendTypeEndLog(logEndpoint, type, true, count, durationMs)
+                        } catch (e: Exception) {
+                            logger("Type end log failed for $type: ${e.message}")
+                        }
+                    }
+                }
+            }
         }
 
-        stateMutex.withLock {
-            val state = inMemoryState ?: return
-            if (state.fullExport) markFullExportDone()
-            logger("Sync: complete (${state.totalSentCount} items, ${state.completedTypes.size} types)")
+        val (totalSent, typeResults) = stateMutex.withLock {
+            val state = inMemoryState
+            val sent = state?.totalSentCount ?: 0
+            val results = types.map { type ->
+                TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
+            }
+            if (state?.fullExport == true) markFullExportDone()
+            if (state != null) logger("Sync: complete ($sent items, ${state.completedTypes.size} types)")
             clearSyncSessionInternal()
+            Pair(sent, results)
         }
+        return RoundRobinResult(true, totalSent, typeResults)
     }
 
     // MARK: - Fetch-Only Chunk Processors (no network)
@@ -610,15 +681,17 @@ class SyncManager(
 
                 val response = httpClient.newCall(requestBuilder.build()).execute()
                 val sizeKb = (response.header("Content-Length")?.toLongOrNull() ?: 0L) / 1024
+                val code = response.code
+                response.body?.close()
 
-                if (response.isSuccessful) return@withContext SendResult(true, response.code, sizeKb.toInt())
-                if (response.code == 401) {
+                if (response.isSuccessful) return@withContext SendResult(true, code, sizeKb.toInt())
+                if (code == 401) {
                     logger("Got 401, refreshing token...")
                     val retryOk = handle401(endpoint, body)
                     return@withContext SendResult(retryOk, if (retryOk) 200 else 401, sizeKb.toInt())
                 }
 
-                SendResult(false, response.code, sizeKb.toInt())
+                SendResult(false, code, sizeKb.toInt())
             } catch (e: Exception) {
                 logger("Upload error: ${e.javaClass.simpleName}: ${e.message}")
                 SendResult(false, null, 0)
@@ -644,12 +717,14 @@ class SyncManager(
                         applyAuth(retryBuilder, newCredential)
 
                         val retryResponse = httpClient.newCall(retryBuilder.build()).execute()
+                        val retryCode = retryResponse.code
+                        retryResponse.body?.close()
                         if (retryResponse.isSuccessful) {
-                            logger("Retry: HTTP ${retryResponse.code}")
+                            logger("Retry: HTTP $retryCode")
                             true
                         } else {
-                            logger("Retry failed: HTTP ${retryResponse.code}")
-                            if (retryResponse.code in 401..403) emitAuthError(401)
+                            logger("Retry failed: HTTP $retryCode")
+                            if (retryCode in 401..403) emitAuthError(401)
                             false
                         }
                     } catch (e: Exception) {
@@ -667,6 +742,175 @@ class SyncManager(
                 logger("Token refresh failed (network) - will retry later")
                 return false
             }
+        }
+    }
+
+    // MARK: - Sync Logging
+
+    private fun payloadTypeName(trackedTypeId: String): String = when (trackedTypeId) {
+        "steps" -> "STEP_COUNT"
+        "heartRate" -> "HEART_RATE"
+        "restingHeartRate" -> "RESTING_HEART_RATE"
+        "heartRateVariabilitySDNN" -> "HEART_RATE_VARIABILITY"
+        "oxygenSaturation" -> "OXYGEN_SATURATION"
+        "bloodPressure", "bloodPressureSystolic" -> "BLOOD_PRESSURE_SYSTOLIC"
+        "bloodPressureDiastolic" -> "BLOOD_PRESSURE_DIASTOLIC"
+        "bloodGlucose" -> "BLOOD_GLUCOSE"
+        "activeEnergy" -> "ACTIVE_CALORIES_BURNED"
+        "basalEnergy" -> "BASAL_METABOLIC_RATE"
+        "bodyTemperature" -> "BODY_TEMPERATURE"
+        "bodyMass" -> "WEIGHT"
+        "height" -> "HEIGHT"
+        "bodyFatPercentage" -> "BODY_FAT"
+        "leanBodyMass" -> "LEAN_BODY_MASS"
+        "flightsClimbed" -> "FLOORS_CLIMBED"
+        "distanceWalkingRunning", "distanceCycling" -> "DISTANCE"
+        "water", "dietaryWater" -> "HYDRATION"
+        "vo2Max" -> "VO2_MAX"
+        "respiratoryRate" -> "RESPIRATORY_RATE"
+        "workout" -> "WORKOUT"
+        "sleep" -> "SLEEP"
+        else -> trackedTypeId.uppercase()
+    }
+
+    private fun buildLogsEndpoint(host: String, userId: String): String {
+        val h = if (host.endsWith("/")) host.dropLast(1) else host
+        return "$h/api/v1/sdk/users/$userId/logs"
+    }
+
+    private fun collectDeviceState(): Map<String, Any> {
+        val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+
+        val batteryLevel = batteryManager
+            ?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            ?.let { it / 100f } ?: -1f
+
+        val batteryIntent = try {
+            context.registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+        } catch (_: Exception) { null }
+        val status = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val batteryState = when (status) {
+            android.os.BatteryManager.BATTERY_STATUS_CHARGING -> "CHARGING"
+            android.os.BatteryManager.BATTERY_STATUS_FULL -> "FULL"
+            android.os.BatteryManager.BATTERY_STATUS_DISCHARGING -> "DISCHARGING"
+            android.os.BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "NOT_CHARGING"
+            else -> "UNKNOWN"
+        }
+
+        val isLowPower = powerManager?.isPowerSaveMode ?: false
+
+        val thermalState = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            when (powerManager?.currentThermalStatus) {
+                android.os.PowerManager.THERMAL_STATUS_NONE -> "NONE"
+                android.os.PowerManager.THERMAL_STATUS_LIGHT -> "LIGHT"
+                android.os.PowerManager.THERMAL_STATUS_MODERATE -> "MODERATE"
+                android.os.PowerManager.THERMAL_STATUS_SEVERE -> "SEVERE"
+                android.os.PowerManager.THERMAL_STATUS_CRITICAL -> "CRITICAL"
+                android.os.PowerManager.THERMAL_STATUS_EMERGENCY -> "EMERGENCY"
+                android.os.PowerManager.THERMAL_STATUS_SHUTDOWN -> "SHUTDOWN"
+                else -> "UNKNOWN"
+            }
+        } else "UNSUPPORTED"
+
+        val memInfo = android.app.ActivityManager.MemoryInfo()
+        activityManager?.getMemoryInfo(memInfo)
+
+        return mapOf(
+            "eventType" to "device_state",
+            "timestamp" to dateFormatter.format(java.time.Instant.now()),
+            "batteryLevel" to batteryLevel,
+            "batteryState" to batteryState,
+            "isLowPowerMode" to isLowPower,
+            "thermalState" to thermalState,
+            "taskType" to "background",
+            "availableRamBytes" to memInfo.availMem,
+            "totalRamBytes" to memInfo.totalMem
+        )
+    }
+
+    private suspend fun countRecordsForTypes(types: List<String>, sinceTimestamp: Long?): Map<String, Int> {
+        val counts = mutableMapOf<String, Int>()
+        for (type in types) {
+            try {
+                var count = 0
+                var cursor = sinceTimestamp
+                while (true) {
+                    val result = healthProvider.readData(type, cursor, 10000)
+                    count += result.data.totalCount
+                    if (result.data.totalCount < 10000 || result.maxTimestamp == null) break
+                    cursor = result.maxTimestamp
+                }
+                counts[type] = count
+            } catch (e: Exception) {
+                logger("Count failed for $type: ${e.message}")
+                counts[type] = 0
+            }
+        }
+        logger("Record counts: ${counts.entries.filter { it.value > 0 }.joinToString { "${it.key}=${it.value}" }}")
+        return counts
+    }
+
+    private suspend fun sendSyncStartLog(logsEndpoint: String, types: List<String>, typeCounts: Map<String, Int>, startTimestamp: Long?) {
+        val dataTypeCounts = types.map { mapOf("type" to payloadTypeName(it), "count" to (typeCounts[it] ?: 0)) }
+
+        val timeRange = mutableMapOf<String, String>(
+            "endDate" to dateFormatter.format(java.time.Instant.now())
+        )
+        startTimestamp?.let {
+            timeRange["startDate"] = dateFormatter.format(java.time.Instant.ofEpochMilli(it))
+        }
+
+        val startEvent: Map<String, Any> = mapOf(
+            "eventType" to "historical_data_sync_start",
+            "timestamp" to dateFormatter.format(java.time.Instant.now()),
+            "dataTypeCounts" to dataTypeCounts,
+            "timeRange" to timeRange
+        )
+
+        val body: Map<String, Any> = mapOf(
+            "sdkVersion" to SyncDefaults.SDK_VERSION,
+            "provider" to healthProvider.providerId,
+            "events" to listOf(startEvent, collectDeviceState())
+        )
+
+        sendSyncLog(logsEndpoint, body)
+    }
+
+    private suspend fun sendTypeEndLog(logsEndpoint: String, type: String, success: Boolean, recordCount: Int, durationMs: Int) {
+        val endEvent: Map<String, Any> = mapOf(
+            "eventType" to "historical_data_type_sync_end",
+            "timestamp" to dateFormatter.format(java.time.Instant.now()),
+            "dataType" to payloadTypeName(type),
+            "success" to success,
+            "recordCount" to recordCount,
+            "durationMs" to durationMs
+        )
+
+        val body: Map<String, Any> = mapOf(
+            "sdkVersion" to SyncDefaults.SDK_VERSION,
+            "provider" to healthProvider.providerId,
+            "events" to listOf(endEvent, collectDeviceState())
+        )
+
+        sendSyncLog(logsEndpoint, body)
+    }
+
+    private suspend fun sendSyncLog(endpoint: String, body: Map<String, Any>) = withContext(dispatchers.io) {
+        try {
+            val requestBody = streamingJsonBody(body)
+            val requestBuilder = Request.Builder()
+                .url(endpoint)
+                .post(requestBody)
+                .header("Content-Type", "application/json")
+            applyAuth(requestBuilder)
+
+            val response = httpClient.newCall(requestBuilder.build()).execute()
+            response.body?.close()
+            logger("Sync log: HTTP ${response.code}")
+        } catch (e: Exception) {
+            logger("Sync log error: ${e.message}")
         }
     }
 

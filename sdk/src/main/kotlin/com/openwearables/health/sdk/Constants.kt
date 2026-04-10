@@ -16,7 +16,7 @@ object SyncDefaults {
     const val CHUNK_SIZE = 2000
     const val WORK_NAME_PERIODIC = "health_sync_periodic"
     const val WORK_NAME_EXPEDITED = "health_sync_expedited"
-    const val SDK_VERSION = "0.9.0"
+    const val SDK_VERSION = "0.10.0"
 }
 
 object StorageKeys {
