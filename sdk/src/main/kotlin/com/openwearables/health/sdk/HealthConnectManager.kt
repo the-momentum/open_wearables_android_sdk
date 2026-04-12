@@ -226,6 +226,15 @@ class HealthConnectManager(
                 "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertVo2Max(it) }
                 "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRespiratoryRate(it) }
                 "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
+                // Time-series metrics written by third-party HC exporters during
+                // workouts (Peloton, Strava, Zwift, cycling computers …). Prior
+                // to these additions the SDK silently dropped them on the floor,
+                // so downstream data_point_series never saw power/speed/calorie/
+                // cadence samples from HC sources.
+                "power", "cyclingPower", "runningPower" -> readRecordType<PowerRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertPower(it) }
+                "speed", "cyclingSpeed", "runningSpeed" -> readRecordType<SpeedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSpeed(it) }
+                "totalCaloriesBurned", "totalEnergy" -> readRecordType<TotalCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertTotalCalories(it) }
+                "cyclingPedalingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
                 "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
@@ -301,6 +310,12 @@ class HealthConnectManager(
         is HydrationRecord -> record.endTime.toEpochMilli()
         is Vo2MaxRecord -> record.time.toEpochMilli()
         is RespiratoryRateRecord -> record.time.toEpochMilli()
+        // HC time-series metrics added alongside the Peloton fix: needed so
+        // the generic pagination anchor tracking works for side-queries.
+        is PowerRecord -> record.endTime.toEpochMilli()
+        is SpeedRecord -> record.endTime.toEpochMilli()
+        is TotalCaloriesBurnedRecord -> record.endTime.toEpochMilli()
+        is CyclingPedalingCadenceRecord -> record.endTime.toEpochMilli()
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
@@ -570,6 +585,80 @@ class HealthConnectManager(
             val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
             UnifiedRecord(r.metadata.id, "HYDRATION", instantToIso(r.startTime), instantToIso(r.endTime),
                 zoneStr(r.startZoneOffset), buildSource(r.metadata), r.volume.inLiters * 1000.0, "mL", null, null)
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // Flatten a PowerRecord (which, like HeartRateRecord, carries a list of
+    // per-instant samples inside each record) into one UnifiedRecord per
+    // sample keyed to the sample's timestamp. The emitted ``type`` is the
+    // HC-native "POWER" string; the backend's SDKMetricType.ANDROID_POWER
+    // entry maps this onto SeriesType.power.
+    private fun convertPower(records: List<PowerRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val parentId = r.metadata.id
+            val source = buildSource(r.metadata)
+            val zo = zoneStr(r.startZoneOffset)
+            for ((idx, sample) in r.samples.withIndex()) {
+                val ts = sample.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+                val iso = instantToIso(sample.time)
+                unified.add(UnifiedRecord("$parentId-p$idx", "POWER", iso, iso, zo, source,
+                    sample.power.inWatts, "W", parentId, null))
+            }
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // Same shape as convertPower: SpeedRecord.samples is a list of instantaneous
+    // Velocity readings. Emitted as SeriesType.speed on the backend.
+    private fun convertSpeed(records: List<SpeedRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val parentId = r.metadata.id
+            val source = buildSource(r.metadata)
+            val zo = zoneStr(r.startZoneOffset)
+            for ((idx, sample) in r.samples.withIndex()) {
+                val ts = sample.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+                val iso = instantToIso(sample.time)
+                unified.add(UnifiedRecord("$parentId-v$idx", "SPEED", iso, iso, zo, source,
+                    sample.speed.inMetersPerSecond, "m/s", parentId, null))
+            }
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // TotalCaloriesBurnedRecord is a single-value interval record (not a
+    // sample list), so we emit one UnifiedRecord per record keyed to the
+    // end time. Backed by SDKMetricType.ANDROID_TOTAL_CALORIES_BURNED →
+    // SeriesType.energy on the backend.
+    private fun convertTotalCalories(records: List<TotalCaloriesBurnedRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
+            UnifiedRecord(r.metadata.id, "TOTAL_CALORIES_BURNED", instantToIso(r.startTime), instantToIso(r.endTime),
+                zoneStr(r.startZoneOffset), buildSource(r.metadata), r.energy.inKilocalories, "kcal", null, null)
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // CyclingPedalingCadenceRecord carries per-instant samples like PowerRecord.
+    // Mapped to SeriesType.cadence on the backend.
+    private fun convertCyclingCadence(records: List<CyclingPedalingCadenceRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val parentId = r.metadata.id
+            val source = buildSource(r.metadata)
+            val zo = zoneStr(r.startZoneOffset)
+            for ((idx, sample) in r.samples.withIndex()) {
+                val ts = sample.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+                val iso = instantToIso(sample.time)
+                unified.add(UnifiedRecord("$parentId-c$idx", "CYCLING_PEDALING_CADENCE", iso, iso, zo, source,
+                    sample.revolutionsPerMinute, "rpm", parentId, null))
+            }
         }
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
@@ -889,6 +978,14 @@ class HealthConnectManager(
         "vo2Max" -> Vo2MaxRecord::class
         "respiratoryRate" -> RespiratoryRateRecord::class
         "distanceCycling" -> DistanceRecord::class
+        // Time-series metrics written by third-party HC exporters (Peloton,
+        // Strava, Zwift, cycling computers, ...). These were previously
+        // absent from the read-type set, so the SDK never requested them
+        // even when HC had the data and the app had asked for them.
+        "power", "cyclingPower", "runningPower" -> PowerRecord::class
+        "speed", "cyclingSpeed", "runningSpeed" -> SpeedRecord::class
+        "totalCaloriesBurned", "totalEnergy" -> TotalCaloriesBurnedRecord::class
+        "cyclingPedalingCadence" -> CyclingPedalingCadenceRecord::class
         "workout" -> ExerciseSessionRecord::class
         "sleep" -> SleepSessionRecord::class
         else -> null
