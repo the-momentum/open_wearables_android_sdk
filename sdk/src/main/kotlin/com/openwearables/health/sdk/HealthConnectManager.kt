@@ -275,10 +275,44 @@ class HealthConnectManager(
         val result = convert(response.records)
 
         val minTs = if (!ascending && response.records.isNotEmpty()) {
-            getRecordTimestamp(response.records.last())
+            // Use startTime (minus 1ms) rather than endTime so the next
+            // descending page's `before(cursor)` strictly excludes this
+            // record. HC's before() filter tests against startTime, so a
+            // SeriesRecord like PowerRecord with [start, end] gets re-included
+            // when cursor = end and start < end.
+            getRecordStartMillis(response.records.last())?.minus(1)
         } else null
 
         return ProviderReadResult(result.data, result.maxTimestamp, minTs)
+    }
+
+    private fun getRecordStartMillis(record: Record): Long? = when (record) {
+        is StepsRecord -> record.startTime.toEpochMilli()
+        is HeartRateRecord -> record.startTime.toEpochMilli()
+        is RestingHeartRateRecord -> record.time.toEpochMilli()
+        is HeartRateVariabilityRmssdRecord -> record.time.toEpochMilli()
+        is OxygenSaturationRecord -> record.time.toEpochMilli()
+        is BloodPressureRecord -> record.time.toEpochMilli()
+        is BloodGlucoseRecord -> record.time.toEpochMilli()
+        is ActiveCaloriesBurnedRecord -> record.startTime.toEpochMilli()
+        is BasalMetabolicRateRecord -> record.time.toEpochMilli()
+        is BodyTemperatureRecord -> record.time.toEpochMilli()
+        is WeightRecord -> record.time.toEpochMilli()
+        is HeightRecord -> record.time.toEpochMilli()
+        is BodyFatRecord -> record.time.toEpochMilli()
+        is LeanBodyMassRecord -> record.time.toEpochMilli()
+        is FloorsClimbedRecord -> record.startTime.toEpochMilli()
+        is DistanceRecord -> record.startTime.toEpochMilli()
+        is HydrationRecord -> record.startTime.toEpochMilli()
+        is Vo2MaxRecord -> record.time.toEpochMilli()
+        is RespiratoryRateRecord -> record.time.toEpochMilli()
+        is PowerRecord -> record.startTime.toEpochMilli()
+        is SpeedRecord -> record.startTime.toEpochMilli()
+        is TotalCaloriesBurnedRecord -> record.startTime.toEpochMilli()
+        is CyclingPedalingCadenceRecord -> record.startTime.toEpochMilli()
+        is ExerciseSessionRecord -> record.startTime.toEpochMilli()
+        is SleepSessionRecord -> record.startTime.toEpochMilli()
+        else -> null
     }
 
     private fun getRecordTimestamp(record: Record): Long? = when (record) {
