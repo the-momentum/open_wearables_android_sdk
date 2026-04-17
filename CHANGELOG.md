@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.0
+
+* **Public `setLogLevel(level)` method** added for parity with iOS. Convenience wrapper around the existing `logLevel` property, intended for cross-platform bridges (React Native, Flutter) and Java callers. The `logLevel` property remains available.
+* **Fixed published Maven version**: the `:sdk` module publication was still declaring `0.9.0` in `build.gradle.kts` despite the `SDK_VERSION` constant being bumped. The published POM now matches the git tag and `SyncDefaults.SDK_VERSION`.
+
 ## 0.10.0
 
 * **Sync telemetry**: new `/logs` endpoint integration for initial full sync diagnostics.
