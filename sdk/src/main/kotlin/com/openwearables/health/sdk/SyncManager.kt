@@ -832,14 +832,15 @@ class SyncManager(
 
     private suspend fun countRecordsForTypes(types: List<String>, sinceTimestamp: Long?): Map<String, Int> {
         val counts = mutableMapOf<String, Int>()
+        val pageSize = 5000  // Health Connect caps readRecords pageSize at 5000.
         for (type in types) {
             try {
                 var count = 0
                 var cursor = sinceTimestamp
                 while (true) {
-                    val result = healthProvider.readData(type, cursor, 10000)
+                    val result = healthProvider.readData(type, cursor, pageSize)
                     count += result.data.totalCount
-                    if (result.data.totalCount < 10000 || result.maxTimestamp == null) break
+                    if (result.data.totalCount < pageSize || result.maxTimestamp == null) break
                     cursor = result.maxTimestamp
                 }
                 counts[type] = count
