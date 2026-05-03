@@ -20,6 +20,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -638,8 +639,9 @@ class SyncManager(
     private data class SendResult(val success: Boolean, val statusCode: Int?, val payloadSizeKb: Int)
 
     private suspend fun sendPayload(endpoint: String, payload: Map<String, Any>): SendResult {
-        val body = streamingJsonBody(payload)
-        return sendWithBody(endpoint, body)
+        val requestBytes = AtomicLong(0)
+        val body = streamingJsonBody(payload, requestBytes)
+        return sendWithBody(endpoint, body, requestBytes)
     }
 
     /**
@@ -648,13 +650,19 @@ class SyncManager(
      * tree or full String is allocated — only the writer's small internal buffer
      * is held in heap, making memory usage O(depth) instead of O(n).
      */
-    private fun streamingJsonBody(payload: Map<String, Any>): RequestBody {
+    private fun streamingJsonBody(payload: Map<String, Any>, requestBytes: AtomicLong? = null): RequestBody {
         return object : okhttp3.RequestBody() {
             override fun contentType() = "application/json".toMediaType()
             override fun writeTo(sink: okio.BufferedSink) {
-                val writer = android.util.JsonWriter(
-                    java.io.OutputStreamWriter(sink.outputStream(), Charsets.UTF_8)
-                )
+                val out = if (requestBytes != null) {
+                    object : java.io.OutputStream() {
+                        private val delegate = sink.outputStream()
+                        override fun write(b: Int) { delegate.write(b); requestBytes.incrementAndGet() }
+                        override fun write(b: ByteArray, off: Int, len: Int) { delegate.write(b, off, len); requestBytes.addAndGet(len.toLong()) }
+                        override fun flush() = delegate.flush()
+                    }
+                } else sink.outputStream()
+                val writer = android.util.JsonWriter(java.io.OutputStreamWriter(out, Charsets.UTF_8))
                 writeValue(writer, payload)
                 writer.flush()
             }
@@ -690,7 +698,7 @@ class SyncManager(
         }
     }
 
-    private suspend fun sendWithBody(endpoint: String, body: okhttp3.RequestBody): SendResult =
+    private suspend fun sendWithBody(endpoint: String, body: okhttp3.RequestBody, requestBytes: AtomicLong? = null): SendResult =
         withContext(dispatchers.io) {
             try {
                 val requestBuilder = Request.Builder()
@@ -700,18 +708,18 @@ class SyncManager(
                 applyAuth(requestBuilder)
 
                 val response = httpClient.newCall(requestBuilder.build()).execute()
-                val sizeKb = (response.header("Content-Length")?.toLongOrNull() ?: 0L) / 1024
+                val sizeKb = ((requestBytes?.get() ?: 0L) / 1024).toInt()
                 val code = response.code
                 response.body?.close()
 
-                if (response.isSuccessful) return@withContext SendResult(true, code, sizeKb.toInt())
+                if (response.isSuccessful) return@withContext SendResult(true, code, sizeKb)
                 if (code == 401) {
                     logger("Got 401, refreshing token...")
                     val retryOk = handle401(endpoint, body)
-                    return@withContext SendResult(retryOk, if (retryOk) 200 else 401, sizeKb.toInt())
+                    return@withContext SendResult(retryOk, if (retryOk) 200 else 401, sizeKb)
                 }
 
-                SendResult(false, code, sizeKb.toInt())
+                SendResult(false, code, sizeKb)
             } catch (e: Exception) {
                 logger("Upload error: ${e.javaClass.simpleName}: ${e.message}")
                 SendResult(false, null, 0)

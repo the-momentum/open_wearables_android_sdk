@@ -2,6 +2,7 @@ package com.openwearables.health.sdk
 
 import android.app.Activity
 import android.content.Context
+import android.net.Uri
 import android.security.KeyChain
 import android.util.Log
 import java.net.Socket
@@ -31,11 +32,9 @@ internal object KeyChainCertProvider {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_ALIAS, null)
 
     fun storeAlias(context: Context, alias: String?) {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().apply {
-            if (alias.isNullOrEmpty()) remove(KEY_ALIAS) else putString(KEY_ALIAS, alias)
-            apply()
-        }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .also { if (alias.isNullOrEmpty()) it.remove(KEY_ALIAS) else it.putString(KEY_ALIAS, alias) }
+            .apply()
     }
 
     /**
@@ -47,22 +46,19 @@ internal object KeyChainCertProvider {
     fun pickAlias(
         activity: Activity,
         hostHint: String? = null,
-        portHint: Int = -1,
         callback: (alias: String?) -> Unit,
     ) {
+        val uri = hostHint?.let { Uri.Builder().scheme("https").authority(it).build() }
         KeyChain.choosePrivateKeyAlias(
             activity,
             { alias ->
-                if (alias != null) {
-                    storeAlias(activity.applicationContext, alias)
-                }
+                if (alias != null) storeAlias(activity.applicationContext, alias)
                 callback(alias)
             },
-            null,        // any key types
-            null,        // any issuers
-            hostHint,
-            portHint,
-            null,        // no preselected alias
+            null,   // any key types
+            null,   // any issuers
+            uri,
+            null,   // no preselected alias
         )
     }
 
