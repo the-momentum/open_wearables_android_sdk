@@ -63,12 +63,30 @@ class SyncManager(
     private val onAuthError: ((Int, String) -> Unit)? = null
 ) {
     companion object {
-        val sharedHttpClient: OkHttpClient by lazy {
-            OkHttpClient.Builder()
+        // Optional mTLS configurator. Set by [MtlsConfigurator] when an mTLS
+        // source is available (KeyChain alias or bundled .p12). Reassigning
+        // this and calling [rebuildSharedHttpClient] swaps the shared client
+        // at runtime so the user can pick a new cert without restarting.
+        @Volatile
+        internal var mtlsConfigurator: ((OkHttpClient.Builder) -> Unit)? = null
+
+        @Volatile
+        private var _sharedHttpClient: OkHttpClient? = null
+
+        @get:Synchronized
+        val sharedHttpClient: OkHttpClient
+            get() = _sharedHttpClient ?: rebuildSharedHttpClient()
+
+        @Synchronized
+        internal fun rebuildSharedHttpClient(): OkHttpClient {
+            val client = OkHttpClient.Builder()
                 .connectTimeout(30, TimeUnit.SECONDS)
                 .readTimeout(120, TimeUnit.SECONDS)
                 .writeTimeout(120, TimeUnit.SECONDS)
+                .also { builder -> mtlsConfigurator?.invoke(builder) }
                 .build()
+            _sharedHttpClient = client
+            return client
         }
     }
 
@@ -78,7 +96,9 @@ class SyncManager(
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val httpClient = sharedHttpClient
+    // Read live each call so cert changes via MtlsConfigurator.reload() take
+    // effect on subsequent requests without recreating the SyncManager.
+    private val httpClient get() = sharedHttpClient
 
     private val dateFormatter: java.time.format.DateTimeFormatter =
         java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
