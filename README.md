@@ -202,6 +202,11 @@ sdk.setProvider("samsung")  // or "google"
 val authorized = sdk.requestAuthorization(
     listOf("steps", "heartRate", "sleep", "workout", "oxygenSaturation")
 )
+
+// Health Connect only: request optional access separately.
+// Denial does not revoke foreground/manual access to the metrics above.
+val historyAuthorized = sdk.requestHistoryReadAuthorization()
+val backgroundAuthorized = sdk.requestBackgroundReadAuthorization()
 ```
 
 ### Start Background Sync

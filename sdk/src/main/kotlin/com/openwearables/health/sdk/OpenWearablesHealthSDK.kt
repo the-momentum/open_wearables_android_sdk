@@ -259,6 +259,26 @@ class OpenWearablesHealthSDK private constructor(
         return provider.requestAuthorization(types)
     }
 
+    /**
+     * Request provider-specific permission to read health data in the background.
+     * This is independent of metric authorization, so denial does not disable manual sync.
+     */
+    suspend fun requestBackgroundReadAuthorization(): Boolean {
+        val provider = getOrCreateProvider()
+        logMessage("Requesting background read authorization via ${provider.providerName}")
+        return provider.requestBackgroundReadAuthorization()
+    }
+
+    /**
+     * Request provider-specific permission to read data older than the default history window.
+     * This is independent of metric authorization, so denial does not disable manual sync.
+     */
+    suspend fun requestHistoryReadAuthorization(): Boolean {
+        val provider = getOrCreateProvider()
+        logMessage("Requesting history read authorization via ${provider.providerName}")
+        return provider.requestHistoryReadAuthorization()
+    }
+
     // -----------------------------------------------------------------------
     // Sync
     // -----------------------------------------------------------------------

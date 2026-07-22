@@ -47,6 +47,18 @@ interface HealthDataProvider {
     suspend fun requestAuthorization(typeIds: List<String>): Boolean
 
     /**
+     * Request permission to read health data while the app is in the background.
+     * Providers that do not expose a separate permission return `false`.
+     */
+    suspend fun requestBackgroundReadAuthorization(): Boolean = false
+
+    /**
+     * Request permission to read health data older than Health Connect's default window.
+     * Providers that do not expose a separate permission return `false`.
+     */
+    suspend fun requestHistoryReadAuthorization(): Boolean = false
+
+    /**
      * Read data for a single type and return it in unified format.
      *
      * @param typeId       Flutter-side type identifier (e.g. `"heartRate"`)

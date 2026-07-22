@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* Added separate Health Connect history-read and background-read authorization methods. Metric authorization no longer requests either optional permission.
+
 ## 0.11.1
 
 * **Fixed JVM signature clash**: removed the redundant `setLogLevel` setter that clashed with the `logLevel` property's generated JVM signature. The public `setLogLevel(level)` method and the `logLevel` property both remain available.

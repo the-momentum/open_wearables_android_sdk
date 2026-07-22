@@ -12,13 +12,13 @@
     <!--
         Health Connect permissions.
 
-        NOTE: READ_HEALTH_DATA_IN_BACKGROUND is a restricted permission.
-        Apps using this SDK must submit a declaration form in the Google Play
-        Console explaining why background health data access is necessary.
-        If denied, the SDK will still work but only read data while the app
-        is in the foreground. Handle the permission-denied case gracefully.
+        NOTE: Background and history access are separate restricted permissions.
+        Apps using this SDK must declare their use in Google Play Console.
+        If either is denied, foreground reads inside Health Connect's default
+        history window continue to work.
     -->
     <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_HISTORY" />
     <uses-permission android:name="android.permission.health.READ_STEPS" />
     <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
     <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE" />

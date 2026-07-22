@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.HealthConnectFeatures
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
@@ -119,50 +120,76 @@ class HealthConnectManager(
 
         val permissions = typeIds.mapNotNull { typeId ->
             mapToRecordClass(typeId)?.let { HealthPermission.getReadPermission(it) }
-        }.toMutableSet()
+        }.toSet()
 
         if (permissions.isEmpty()) {
             logger("No valid Health Connect types to authorize")
             return false
         }
 
-        permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
+        return requestPermissions(permissions, "health data")
+    }
 
+    override suspend fun requestBackgroundReadAuthorization(): Boolean =
+        requestOptionalPermission(
+            permission = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND,
+            feature = HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND,
+            label = "background health data"
+        )
+
+    override suspend fun requestHistoryReadAuthorization(): Boolean =
+        requestOptionalPermission(
+            permission = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY,
+            feature = HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_HISTORY,
+            label = "historical health data"
+        )
+
+    private suspend fun requestOptionalPermission(
+        permission: String,
+        feature: Int,
+        label: String
+    ): Boolean {
+        if (client == null && !connect()) return false
+        val hcClient = client ?: return false
+        if (hcClient.features.getFeatureStatus(feature) != HealthConnectFeatures.FEATURE_STATUS_AVAILABLE) {
+            logger("Health Connect $label permission is not available on this device")
+            return false
+        }
+        return requestPermissions(setOf(permission), label)
+    }
+
+    private suspend fun requestPermissions(permissions: Set<String>, label: String): Boolean {
         if (client == null && !connect()) return false
         val hcClient = client ?: return false
 
         val alreadyGranted = hcClient.permissionController.getGrantedPermissions()
         val needed = permissions - alreadyGranted
         if (needed.isEmpty()) {
-            logger("All ${permissions.size} Health Connect permissions already granted (including background read)")
+            logger("All ${permissions.size} Health Connect $label permissions already granted")
             return true
         }
 
         val launcher = permissionLauncher
         if (launcher == null) {
-            logger("Permission launcher not registered — cannot request HC permissions")
+            logger("Permission launcher not registered — cannot request Health Connect $label permissions")
             return false
         }
 
         return try {
             val deferred = CompletableDeferred<Set<String>>()
             pendingPermissionResult = deferred
-
-            logger("Launching Health Connect permission dialog for ${needed.size} permissions (includes background read)")
+            logger("Launching Health Connect permission dialog for ${needed.size} $label permissions")
             launcher.launch(needed)
 
             val granted = deferred.await()
-            pendingPermissionResult = null
-
-            val totalGranted = alreadyGranted + granted
-            val bgGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in totalGranted
-            val dataPermsGranted = (permissions - HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND).all { it in totalGranted }
-            logger("Data permissions: ${if (dataPermsGranted) "all granted" else "some missing"}, background read: ${if (bgGranted) "granted" else "NOT granted"}")
-            dataPermsGranted
+            permissionRequestGranted(permissions, alreadyGranted, granted).also { authorized ->
+                logger("Health Connect $label permissions: ${if (authorized) "granted" else "denied"}")
+            }
         } catch (e: Exception) {
-            logger("Health Connect permission request failed: ${e.message}")
-            pendingPermissionResult = null
+            logger("Health Connect $label permission request failed: ${e.message}")
             false
+        } finally {
+            pendingPermissionResult = null
         }
     }
 
