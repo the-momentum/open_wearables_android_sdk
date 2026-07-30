@@ -88,12 +88,32 @@ afterEvaluate {
                     url.set("https://github.com/the-momentum/open_wearables_android_sdk")
                 }
             }
+
+            // Samsung Health Data SDK isn't on a public registry (only vendored under
+            // libs/maven). Re-publish it alongside our own artifact so consumers only
+            // need one maven repo to resolve this SDK's full dependency tree.
+            create<MavenPublication>("samsungHealthData") {
+                groupId = "com.samsung.android.health"
+                artifactId = "data"
+                version = "1.0.0"
+                artifact("${project.projectDir}/libs/maven/com/samsung/android/health/data/1.0.0/data-1.0.0.aar") {
+                    extension = "aar"
+                }
+            }
         }
 
         repositories {
             maven {
                 name = "mavenLocal"
                 url = uri("${System.getProperty("user.home")}/.m2/repository")
+            }
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/Ameya-Annapurna/open_wearables_android_sdk")
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR")
+                    password = System.getenv("GITHUB_TOKEN")
+                }
             }
         }
     }
