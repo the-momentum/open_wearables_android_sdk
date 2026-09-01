@@ -42,6 +42,12 @@ class SamsungHealthManager(
     private var deviceCache: MutableMap<String, Device> = mutableMapOf()
     private var activityRef: WeakReference<Activity>? = activity?.let { WeakReference(it) }
 
+    /**
+     * Tolerance for future clock skew when validating provider timestamps (see #25).
+     * Public var so hosts can tighten/loosen it; applied in [readData] and [readDataDescending].
+     */
+    var futureSkewToleranceMs: Long = TimestampSanity.DEFAULT_FUTURE_SKEW_MS
+
     companion object {
         private const val SAMSUNG_HEALTH_PACKAGE = "com.sec.android.app.shealth"
         private const val MIN_SAMSUNG_HEALTH_VERSION = 6030002
@@ -165,7 +171,7 @@ class SamsungHealthManager(
     ): ProviderReadResult {
         val rawRecords = readRawData(typeId, sinceTimestamp, limit)
         if (rawRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
-        return convertToUnified(typeId, rawRecords)
+        return convertToUnified(typeId, filterImplausibleTimestamps(typeId, rawRecords))
     }
 
     override suspend fun readDataDescending(
@@ -175,7 +181,20 @@ class SamsungHealthManager(
     ): ProviderReadResult {
         val rawRecords = readRawDataDescending(typeId, olderThanTimestamp, limit)
         if (rawRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
-        return convertToUnified(typeId, rawRecords)
+        return convertToUnified(typeId, filterImplausibleTimestamps(typeId, rawRecords))
+    }
+
+    /**
+     * Drops records whose start/end timestamps are implausible (negative or beyond the
+     * future-skew tolerance) BEFORE they can reach payloads, min/max cursors or sync
+     * anchors. Logs a PII-free count so the corruption stays observable. See #25.
+     */
+    private fun filterImplausibleTimestamps(typeId: String, records: List<HealthDataRecord>): List<HealthDataRecord> {
+        val (plausible, rejected) = TimestampSanity.partition(records, futureSkewMs = futureSkewToleranceMs)
+        if (rejected.isNotEmpty()) {
+            logger("[$typeId] dropped ${rejected.size} record(s) with implausible timestamps (future beyond ${futureSkewToleranceMs}ms tolerance or negative)")
+        }
+        return plausible
     }
 
     // -----------------------------------------------------------------------

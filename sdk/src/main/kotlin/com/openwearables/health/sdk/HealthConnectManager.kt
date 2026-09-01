@@ -36,6 +36,12 @@ class HealthConnectManager(
     private var launcherRegistered = false
     private var activityRef: WeakReference<Activity>? = activity?.let { WeakReference(it) }
 
+    /**
+     * Tolerance for future clock skew when validating provider timestamps (see #25).
+     * Public var so hosts can tighten/loosen it; applied in [readRecordType], [readWorkouts] and [readSleep].
+     */
+    var futureSkewToleranceMs: Long = TimestampSanity.DEFAULT_FUTURE_SKEW_MS
+
     // -----------------------------------------------------------------------
     // HealthDataProvider interface
     // -----------------------------------------------------------------------
@@ -271,11 +277,14 @@ class HealthConnectManager(
         val response = client.readRecords(request)
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        logger("Read ${response.records.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
-        val result = convert(response.records)
+        val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps(typeId, response.records)
+        if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
-            getRecordTimestamp(response.records.last())
+        logger("Read ${plausibleRecords.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
+        val result = convert(plausibleRecords)
+
+        val minTs = if (!ascending && plausibleRecords.isNotEmpty()) {
+            getRecordTimestamp(plausibleRecords.last())
         } else null
 
         return ProviderReadResult(result.data, result.maxTimestamp, minTs)
@@ -304,6 +313,22 @@ class HealthConnectManager(
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
+    }
+
+    private fun <T : Record> filterRecordsWithImplausibleTimestamps(
+        typeId: String,
+        records: List<T>
+    ): Pair<List<T>, Int> {
+        val now = System.currentTimeMillis()
+        val plausible = records.filter { r ->
+            val ts = getRecordTimestamp(r)
+            ts == null || !TimestampSanity.isImplausible(ts, now, futureSkewToleranceMs)
+        }
+        val rejected = records.size - plausible.size
+        if (rejected > 0) {
+            logger("[$typeId] dropped $rejected record(s) with implausible timestamps (future beyond ${futureSkewToleranceMs}ms tolerance or negative)")
+        }
+        return plausible to rejected
     }
 
     // -----------------------------------------------------------------------
@@ -626,8 +651,11 @@ class HealthConnectManager(
         )
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
+        val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps("workout", response.records)
+        if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+
         var maxTs: Long? = null
-        val workouts = response.records.map { r ->
+        val workouts = plausibleRecords.map { r ->
             val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
             val source = buildSource(r.metadata)
             val zo = zoneStr(r.startZoneOffset)
@@ -689,8 +717,8 @@ class HealthConnectManager(
             )
         }
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
-            response.records.last().endTime.toEpochMilli()
+        val minTs = if (!ascending && plausibleRecords.isNotEmpty()) {
+            plausibleRecords.last().endTime.toEpochMilli()
         } else null
 
         return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs)
@@ -804,12 +832,15 @@ class HealthConnectManager(
                 pageSize = limit
             )
         )
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+
+        val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps("sleep", response.records)
+        if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
         var maxTs: Long? = null
         val sleepEntries = mutableListOf<UnifiedSleep>()
 
-        for (r in response.records) {
+        for (r in plausibleRecords) {
             try {
                 val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
                 val source = buildSource(r.metadata)
@@ -847,8 +878,8 @@ class HealthConnectManager(
             }
         }
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
-            response.records.last().endTime.toEpochMilli()
+        val minTs = if (!ascending && plausibleRecords.isNotEmpty()) {
+            plausibleRecords.last().endTime.toEpochMilli()
         } else null
 
         return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs)
