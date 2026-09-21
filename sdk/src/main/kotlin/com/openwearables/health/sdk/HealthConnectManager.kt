@@ -240,7 +240,7 @@ class HealthConnectManager(
                 "power", "cyclingPower", "runningPower" -> readRecordType<PowerRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertPower(it) }
                 "speed", "cyclingSpeed", "runningSpeed" -> readRecordType<SpeedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSpeed(it) }
                 "totalCaloriesBurned", "totalEnergy" -> readRecordType<TotalCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertTotalCalories(it) }
-                "cyclingPedalingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
+                "cyclingPedalingCadence", "cyclingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
                 "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
@@ -1206,7 +1206,7 @@ class HealthConnectManager(
         "power", "cyclingPower", "runningPower" -> PowerRecord::class
         "speed", "cyclingSpeed", "runningSpeed" -> SpeedRecord::class
         "totalCaloriesBurned", "totalEnergy" -> TotalCaloriesBurnedRecord::class
-        "cyclingPedalingCadence" -> CyclingPedalingCadenceRecord::class
+        "cyclingPedalingCadence", "cyclingCadence" -> CyclingPedalingCadenceRecord::class
         "workout" -> ExerciseSessionRecord::class
         "sleep" -> SleepSessionRecord::class
         else -> null
