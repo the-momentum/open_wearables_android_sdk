@@ -6,6 +6,7 @@
 * **`redeemInvitationCode(host, code)`**: POST `{host}/api/v1/invitation-code/redeem` through the same OkHttp client, so redeem also sends the client cert when mTLS is configured.
 * **Upload metrics**: streamed sync payloads now count the actual bytes sent instead of the response `Content-Length`.
 * **Repo cleanup**: stop tracking accidentally committed `sdk/build/` artifacts (already in `.gitignore`).
+* **Reject implausible timestamps** (#35, #28, #25): Samsung/Health Connect records with negative or far-future timestamps (observed: Fit3 heart-rate samples dated 2033–2105) are dropped at the read funnel before they can reach payloads, cursors, or persisted sync anchors. Default future-skew tolerance is 5 minutes.
 
 ## 0.12.0
 
