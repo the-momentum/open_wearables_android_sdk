@@ -39,7 +39,7 @@ class SamsungHealthManager(
     private var healthDataStore: HealthDataStore? = null
     private var deviceManager: DeviceManager? = null
     private var trackedTypeIds: Set<String> = emptySet()
-    private var deviceCache: MutableMap<String, Device> = mutableMapOf()
+    private var deviceCache: MutableMap<String, CachedSamsungDevice> = mutableMapOf()
     private var activityRef: WeakReference<Activity>? = activity?.let { WeakReference(it) }
 
     /**
@@ -842,7 +842,11 @@ class SamsungHealthManager(
         deviceName = raw.device.name,
         deviceManufacturer = raw.device.manufacturer,
         deviceModel = raw.device.model,
-        deviceType = DeviceTypeMapper.fromSamsungDeviceType(raw.device.deviceType),
+        deviceType = DeviceTypeMapper.fromSamsungDeviceType(
+            raw.device.deviceType,
+            raw.device.name,
+            raw.device.model,
+        ),
         recordingMethod = null
     )
 
@@ -877,7 +881,13 @@ class SamsungHealthManager(
         try {
             for (group in listOf(DeviceGroup.MOBILE, DeviceGroup.WATCH, DeviceGroup.RING, DeviceGroup.BAND, DeviceGroup.ACCESSORY)) {
                 try {
-                    dm.getDevices(group).forEach { device -> device.id?.let { deviceCache[it] = device } }
+                    dm.getDevices(group).forEach { device ->
+                        val id = device.id ?: return@forEach
+                        val existing = deviceCache[id]
+                        if (existing == null || samsungGroupRank(group) >= samsungGroupRank(existing.group)) {
+                            deviceCache[id] = CachedSamsungDevice(device, group)
+                        }
+                    }
                 } catch (_: Exception) {}
             }
             logger("Loaded ${deviceCache.size} devices from Samsung Health")
@@ -997,9 +1007,10 @@ class SamsungHealthManager(
 
     private fun getDeviceInfo(source: DataSource?): DeviceInfo {
         val deviceId = source?.deviceId
-        val cachedDevice = deviceId?.let { deviceCache[it] }
+        val cached = deviceId?.let { deviceCache[it] }
 
-        if (cachedDevice != null) {
+        if (cached != null) {
+            val cachedDevice = cached.device
             return DeviceInfo(
                 deviceId = deviceId,
                 manufacturer = cachedDevice.manufacturer ?: "Unknown",
@@ -1010,7 +1021,7 @@ class SamsungHealthManager(
                 osType = "Android",
                 osVersion = "",
                 sdkVersion = 0,
-                deviceType = getDeviceGroup(cachedDevice),
+                deviceType = cached.group.name,
                 isSourceDevice = true
             )
         }
@@ -1030,18 +1041,12 @@ class SamsungHealthManager(
         )
     }
 
-    private fun getDeviceGroup(device: Device): String {
-        return try {
-            val groupMethod = device.javaClass.methods.find { it.name == "getGroup" || it.name == "getDeviceGroup" }
-            val group = groupMethod?.invoke(device)
-            when {
-                group is DeviceGroup -> group.name
-                group?.toString()?.contains("WATCH", ignoreCase = true) == true -> "WATCH"
-                group?.toString()?.contains("RING", ignoreCase = true) == true -> "RING"
-                group?.toString()?.contains("BAND", ignoreCase = true) == true -> "BAND"
-                else -> "MOBILE"
-            }
-        } catch (_: Exception) { "UNKNOWN" }
+    /** Prefer a wearable query group over MOBILE when the same id appears in both. */
+    private fun samsungGroupRank(group: DeviceGroup): Int = when (group) {
+        DeviceGroup.WATCH, DeviceGroup.RING, DeviceGroup.BAND -> 3
+        DeviceGroup.ACCESSORY -> 2
+        DeviceGroup.MOBILE -> 1
+        else -> 0
     }
 
     private fun getDataTypeName(typeId: String): String = when (typeId) {
@@ -1240,3 +1245,8 @@ class SamsungHealthManager(
         } catch (_: Exception) { null }
     }
 }
+
+private data class CachedSamsungDevice(
+    val device: Device,
+    val group: DeviceGroup,
+)
