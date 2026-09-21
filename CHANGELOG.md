@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.0 (unreleased)
+
+* **Optional mTLS client certificates** (#34, #16): the shared OkHttp client can present a client cert from the Android KeyChain (`pickClientCertificate` / `clearClientCertificate`) or a bundled `.p12` in assets. No cert configured = plain TLS, so existing backends keep working. The HTTP client reloads at runtime when the alias changes.
+* **`redeemInvitationCode(host, code)`**: POST `{host}/api/v1/invitation-code/redeem` through the same OkHttp client, so redeem also sends the client cert when mTLS is configured.
+* **Upload metrics**: streamed sync payloads now count the actual bytes sent instead of the response `Content-Length`.
+* **Repo cleanup**: stop tracking accidentally committed `sdk/build/` artifacts (already in `.gitignore`).
+
 ## 0.12.0
 
 * **Health Connect: power / speed / cadence / total calories** (#12): the SDK now reads `PowerRecord`, `SpeedRecord`, `CyclingPedalingCadenceRecord`, and `TotalCaloriesBurnedRecord` when the host app requests them. Previously those type IDs were silently dropped even when Health Connect had the data (Peloton, Strava, Zwift, Garmin). Emitted as `POWER` / `SPEED` / `CYCLING_PEDALING_CADENCE` / `TOTAL_CALORIES_BURNED`.
