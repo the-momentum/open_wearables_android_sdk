@@ -860,14 +860,15 @@ class SyncManager(
 
     private suspend fun countRecordsForTypes(types: List<String>, sinceTimestamp: Long?): Map<String, Int> {
         val counts = mutableMapOf<String, Int>()
+        val pageSize = 5000  // Health Connect caps readRecords pageSize at 5000.
         for (type in types) {
             try {
                 var count = 0
                 var cursor = sinceTimestamp
                 while (true) {
-                    val result = healthProvider.readData(type, cursor, 10000)
+                    val result = healthProvider.readData(type, cursor, pageSize)
                     count += result.data.totalCount
-                    if (result.data.totalCount < 10000 || result.maxTimestamp == null) break
+                    if (result.data.totalCount < pageSize || result.maxTimestamp == null) break
                     cursor = result.maxTimestamp
                 }
                 counts[type] = count
@@ -1033,12 +1034,17 @@ class SyncManager(
 
     fun getSyncStatus(): Map<String, Any?> {
         val state = inMemoryState ?: loadSyncStateFromDisk()
+        // Whether the initial full export (whole history) has ever completed for
+        // this user. While false, apps can show a "keep the app open" hint.
+        val initialExportDone = hasCompletedInitialSync()
         return if (state != null) {
             mapOf(
                 "hasResumableSession" to state.hasProgress,
                 "sentCount" to state.totalSentCount,
                 "completedTypes" to state.completedTypes.size,
                 "isFullExport" to state.fullExport,
+                "initialExportDone" to initialExportDone,
+                "isSyncing" to isSyncing.get(),
                 "createdAt" to dateFormatter.format(java.time.Instant.ofEpochMilli(state.createdAt))
             )
         } else {
@@ -1047,6 +1053,8 @@ class SyncManager(
                 "sentCount" to 0,
                 "completedTypes" to 0,
                 "isFullExport" to false,
+                "initialExportDone" to initialExportDone,
+                "isSyncing" to isSyncing.get(),
                 "createdAt" to null
             )
         }

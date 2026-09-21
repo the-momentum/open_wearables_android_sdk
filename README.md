@@ -236,9 +236,6 @@ sdk.authErrorListener = { statusCode, message ->
 ### Sync Control
 
 ```kotlin
-// Trigger sync immediately
-sdk.syncNow()
-
 // Check sync status
 val status = sdk.getSyncStatus()
 // {"hasResumableSession": true, "sentCount": 1500, "completedTypes": 3, ...}

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.12.0
+
+* **Health Connect: power / speed / cadence / total calories** (#12): the SDK now reads `PowerRecord`, `SpeedRecord`, `CyclingPedalingCadenceRecord`, and `TotalCaloriesBurnedRecord` when the host app requests them. Previously those type IDs were silently dropped even when Health Connect had the data (Peloton, Strava, Zwift, Garmin). Emitted as `POWER` / `SPEED` / `CYCLING_PEDALING_CADENCE` / `TOTAL_CALORIES_BURNED`.
+* **Health Connect workouts: session aggregates** (#13): `readWorkouts` no longer sends only `duration`. Each exercise session now side-queries HR / power / speed / distance / total calories / cadence in the session window and attaches min/avg/max stats (`averageHeartRate`, `averageRunningPower`, `distance`, `totalCalories`, …) so `workout_details` can populate. Time-series `samples` on the workout stay empty.
+* **Health Connect pagination** (#14): descending full-export cursor now uses `startTime - 1ms` so range records (steps, distance, workouts, …) are not re-included at page boundaries. `countRecordsForTypes` page size capped at Health Connect’s 5000 limit (was 10000), so sync-start counts no longer under-report.
+
+## 0.11.2
+
+* **New `getSyncStatus()` fields**: `initialExportDone` (Bool) and `isSyncing` (Bool) — allows apps to show progress UI during the initial historical export.
+
+## 0.11.1
+
+* **Fixed JVM signature clash**: removed the redundant `setLogLevel` setter that clashed with the `logLevel` property's generated JVM signature.
+
 ## 0.11.0
 
 * **Public `setLogLevel(level)` method** added for parity with iOS. Convenience wrapper around the existing `logLevel` property, intended for cross-platform bridges (React Native, Flutter) and Java callers. The `logLevel` property remains available.

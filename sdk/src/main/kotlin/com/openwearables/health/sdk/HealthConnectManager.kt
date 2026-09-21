@@ -226,6 +226,15 @@ class HealthConnectManager(
                 "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertVo2Max(it) }
                 "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRespiratoryRate(it) }
                 "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
+                // Time-series metrics written by third-party HC exporters during
+                // workouts (Peloton, Strava, Zwift, cycling computers …). Prior
+                // to these additions the SDK silently dropped them on the floor,
+                // so downstream data_point_series never saw power/speed/calorie/
+                // cadence samples from HC sources.
+                "power", "cyclingPower", "runningPower" -> readRecordType<PowerRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertPower(it) }
+                "speed", "cyclingSpeed", "runningSpeed" -> readRecordType<SpeedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSpeed(it) }
+                "totalCaloriesBurned", "totalEnergy" -> readRecordType<TotalCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertTotalCalories(it) }
+                "cyclingPedalingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
                 "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
@@ -275,10 +284,44 @@ class HealthConnectManager(
         val result = convert(response.records)
 
         val minTs = if (!ascending && response.records.isNotEmpty()) {
-            getRecordTimestamp(response.records.last())
+            // Use startTime (minus 1ms) rather than endTime so the next
+            // descending page's `before(cursor)` strictly excludes this
+            // record. HC's before() filter tests against startTime, so a
+            // SeriesRecord like PowerRecord with [start, end] gets re-included
+            // when cursor = end and start < end.
+            getRecordStartMillis(response.records.last())?.minus(1)
         } else null
 
         return ProviderReadResult(result.data, result.maxTimestamp, minTs)
+    }
+
+    private fun getRecordStartMillis(record: Record): Long? = when (record) {
+        is StepsRecord -> record.startTime.toEpochMilli()
+        is HeartRateRecord -> record.startTime.toEpochMilli()
+        is RestingHeartRateRecord -> record.time.toEpochMilli()
+        is HeartRateVariabilityRmssdRecord -> record.time.toEpochMilli()
+        is OxygenSaturationRecord -> record.time.toEpochMilli()
+        is BloodPressureRecord -> record.time.toEpochMilli()
+        is BloodGlucoseRecord -> record.time.toEpochMilli()
+        is ActiveCaloriesBurnedRecord -> record.startTime.toEpochMilli()
+        is BasalMetabolicRateRecord -> record.time.toEpochMilli()
+        is BodyTemperatureRecord -> record.time.toEpochMilli()
+        is WeightRecord -> record.time.toEpochMilli()
+        is HeightRecord -> record.time.toEpochMilli()
+        is BodyFatRecord -> record.time.toEpochMilli()
+        is LeanBodyMassRecord -> record.time.toEpochMilli()
+        is FloorsClimbedRecord -> record.startTime.toEpochMilli()
+        is DistanceRecord -> record.startTime.toEpochMilli()
+        is HydrationRecord -> record.startTime.toEpochMilli()
+        is Vo2MaxRecord -> record.time.toEpochMilli()
+        is RespiratoryRateRecord -> record.time.toEpochMilli()
+        is PowerRecord -> record.startTime.toEpochMilli()
+        is SpeedRecord -> record.startTime.toEpochMilli()
+        is TotalCaloriesBurnedRecord -> record.startTime.toEpochMilli()
+        is CyclingPedalingCadenceRecord -> record.startTime.toEpochMilli()
+        is ExerciseSessionRecord -> record.startTime.toEpochMilli()
+        is SleepSessionRecord -> record.startTime.toEpochMilli()
+        else -> null
     }
 
     private fun getRecordTimestamp(record: Record): Long? = when (record) {
@@ -301,6 +344,12 @@ class HealthConnectManager(
         is HydrationRecord -> record.endTime.toEpochMilli()
         is Vo2MaxRecord -> record.time.toEpochMilli()
         is RespiratoryRateRecord -> record.time.toEpochMilli()
+        // HC time-series metrics added alongside the Peloton fix: needed so
+        // the generic pagination anchor tracking works for side-queries.
+        is PowerRecord -> record.endTime.toEpochMilli()
+        is SpeedRecord -> record.endTime.toEpochMilli()
+        is TotalCaloriesBurnedRecord -> record.endTime.toEpochMilli()
+        is CyclingPedalingCadenceRecord -> record.endTime.toEpochMilli()
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
@@ -574,6 +623,80 @@ class HealthConnectManager(
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
 
+    // Flatten a PowerRecord (which, like HeartRateRecord, carries a list of
+    // per-instant samples inside each record) into one UnifiedRecord per
+    // sample keyed to the sample's timestamp. The emitted ``type`` is the
+    // HC-native "POWER" string; the backend's SDKMetricType.ANDROID_POWER
+    // entry maps this onto SeriesType.power.
+    private fun convertPower(records: List<PowerRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val parentId = r.metadata.id
+            val source = buildSource(r.metadata)
+            val zo = zoneStr(r.startZoneOffset)
+            for ((idx, sample) in r.samples.withIndex()) {
+                val ts = sample.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+                val iso = instantToIso(sample.time)
+                unified.add(UnifiedRecord("$parentId-p$idx", "POWER", iso, iso, zo, source,
+                    sample.power.inWatts, "W", parentId, null))
+            }
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // Same shape as convertPower: SpeedRecord.samples is a list of instantaneous
+    // Velocity readings. Emitted as SeriesType.speed on the backend.
+    private fun convertSpeed(records: List<SpeedRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val parentId = r.metadata.id
+            val source = buildSource(r.metadata)
+            val zo = zoneStr(r.startZoneOffset)
+            for ((idx, sample) in r.samples.withIndex()) {
+                val ts = sample.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+                val iso = instantToIso(sample.time)
+                unified.add(UnifiedRecord("$parentId-v$idx", "SPEED", iso, iso, zo, source,
+                    sample.speed.inMetersPerSecond, "m/s", parentId, null))
+            }
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // TotalCaloriesBurnedRecord is a single-value interval record (not a
+    // sample list), so we emit one UnifiedRecord per record keyed to the
+    // end time. Backed by SDKMetricType.ANDROID_TOTAL_CALORIES_BURNED →
+    // SeriesType.energy on the backend.
+    private fun convertTotalCalories(records: List<TotalCaloriesBurnedRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
+            UnifiedRecord(r.metadata.id, "TOTAL_CALORIES_BURNED", instantToIso(r.startTime), instantToIso(r.endTime),
+                zoneStr(r.startZoneOffset), buildSource(r.metadata), r.energy.inKilocalories, "kcal", null, null)
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    // CyclingPedalingCadenceRecord carries per-instant samples like PowerRecord.
+    // Mapped to SeriesType.cadence on the backend.
+    private fun convertCyclingCadence(records: List<CyclingPedalingCadenceRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val parentId = r.metadata.id
+            val source = buildSource(r.metadata)
+            val zo = zoneStr(r.startZoneOffset)
+            for ((idx, sample) in r.samples.withIndex()) {
+                val ts = sample.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+                val iso = instantToIso(sample.time)
+                unified.add(UnifiedRecord("$parentId-c$idx", "CYCLING_PEDALING_CADENCE", iso, iso, zo, source,
+                    sample.revolutionsPerMinute, "rpm", parentId, null))
+            }
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
     private fun convertRespiratoryRate(records: List<RespiratoryRateRecord>): ProviderReadResult {
         var maxTs: Long? = null
         val unified = records.map { r ->
@@ -637,6 +760,16 @@ class HealthConnectManager(
                 mapOf("type" to "duration", "value" to duration, "unit" to "s")
             )
 
+            // Side-query the linked time-series records bounded to this
+            // exercise session so the backend receives aggregate
+            // heart-rate / power / speed / distance / calorie metrics for
+            // the workout. Prior to this change ``readWorkouts`` left
+            // ``samples = null`` and ``values`` only contained the
+            // duration, so ``workout_details`` rows landed completely
+            // empty for every HC-sourced workout. See Bug 1 in the
+            // Peloton upstream issue for details.
+            attachLinkedWorkoutMetrics(client, r, values)
+
             val segments = r.segments.map { seg ->
                 mapOf<String, Any?>(
                     "startDate" to instantToIso(seg.startTime),
@@ -694,6 +827,152 @@ class HealthConnectManager(
         } else null
 
         return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs)
+    }
+
+    /**
+     * For an ``ExerciseSessionRecord``, issue bounded ``readRecords<T>``
+     * calls for each linked time-series type HC supports for workouts —
+     * HeartRate, Power, Speed, TotalCaloriesBurned, Distance — and emit
+     * aggregate ``WorkoutStatistic``-shaped entries into ``values``. The
+     * keys mirror [WorkoutStatisticType] on the backend so the existing
+     * ``_extract_metrics_from_workout_stats`` pipeline picks them up
+     * without any backend change.
+     *
+     * Every side-query is wrapped in its own try/catch so a missing
+     * permission or empty result for one type never aborts the others.
+     * Errors are logged at debug level (the SDK's general logger) so
+     * users can diagnose permission problems without the whole workout
+     * ingest breaking.
+     */
+    private suspend fun attachLinkedWorkoutMetrics(
+        client: HealthConnectClient,
+        session: ExerciseSessionRecord,
+        values: MutableList<Map<String, Any>>,
+    ) {
+        val window = TimeRangeFilter.between(session.startTime, session.endTime)
+        val sessionPackage = session.metadata.dataOrigin.packageName
+        fun sameWriter(meta: Metadata): Boolean =
+            sessionPackage.isNotEmpty() && meta.dataOrigin.packageName == sessionPackage
+
+        // Heart rate (per-sample, min/avg/max)
+        try {
+            val hr = client.readRecords(
+                ReadRecordsRequest(
+                    recordType = HeartRateRecord::class,
+                    timeRangeFilter = window,
+                )
+            )
+            val samples = hr.records
+                .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
+                .flatMap { it.samples }
+            if (samples.isNotEmpty()) {
+                val minBpm = samples.minOf { it.beatsPerMinute }.toDouble()
+                val maxBpm = samples.maxOf { it.beatsPerMinute }.toDouble()
+                val avgBpm = samples.sumOf { it.beatsPerMinute.toDouble() } / samples.size
+                values += mapOf("type" to "minHeartRate", "value" to minBpm, "unit" to "bpm")
+                values += mapOf("type" to "averageHeartRate", "value" to avgBpm, "unit" to "bpm")
+                values += mapOf("type" to "maxHeartRate", "value" to maxBpm, "unit" to "bpm")
+            }
+        } catch (e: Exception) {
+            logger("readWorkouts: skipping HeartRate aggregates: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Power (PowerRecord — per-sample; emit averageRunningPower because
+        // the backend keys on this name to populate average_watts for any
+        // workout type, not just running).
+        try {
+            val pr = client.readRecords(
+                ReadRecordsRequest(
+                    recordType = PowerRecord::class,
+                    timeRangeFilter = window,
+                )
+            )
+            val samples = pr.records
+                .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
+                .flatMap { it.samples }
+            if (samples.isNotEmpty()) {
+                val avgW = samples.sumOf { it.power.inWatts } / samples.size
+                values += mapOf("type" to "averageRunningPower", "value" to avgW, "unit" to "W")
+            }
+        } catch (e: Exception) {
+            logger("readWorkouts: skipping Power aggregates: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Speed (SpeedRecord — per-sample; averageSpeed + maxSpeed)
+        try {
+            val sr = client.readRecords(
+                ReadRecordsRequest(
+                    recordType = SpeedRecord::class,
+                    timeRangeFilter = window,
+                )
+            )
+            val samples = sr.records
+                .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
+                .flatMap { it.samples }
+            if (samples.isNotEmpty()) {
+                val avg = samples.sumOf { it.speed.inMetersPerSecond } / samples.size
+                val max = samples.maxOf { it.speed.inMetersPerSecond }
+                values += mapOf("type" to "averageSpeed", "value" to avg, "unit" to "m/s")
+                values += mapOf("type" to "maxSpeed", "value" to max, "unit" to "m/s")
+            }
+        } catch (e: Exception) {
+            logger("readWorkouts: skipping Speed aggregates: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Distance (DistanceRecord — sum across the window)
+        try {
+            val dr = client.readRecords(
+                ReadRecordsRequest(
+                    recordType = DistanceRecord::class,
+                    timeRangeFilter = window,
+                )
+            )
+            val totalM = dr.records
+                .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
+                .sumOf { it.distance.inMeters }
+            if (totalM > 0) {
+                values += mapOf("type" to "distance", "value" to totalM, "unit" to "m")
+            }
+        } catch (e: Exception) {
+            logger("readWorkouts: skipping Distance aggregates: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Total calories burned (TotalCaloriesBurnedRecord — sum across the window)
+        try {
+            val cr = client.readRecords(
+                ReadRecordsRequest(
+                    recordType = TotalCaloriesBurnedRecord::class,
+                    timeRangeFilter = window,
+                )
+            )
+            val totalKcal = cr.records
+                .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
+                .sumOf { it.energy.inKilocalories }
+            if (totalKcal > 0) {
+                values += mapOf("type" to "totalCalories", "value" to totalKcal, "unit" to "kcal")
+            }
+        } catch (e: Exception) {
+            logger("readWorkouts: skipping TotalCalories aggregates: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Cadence (CyclingPedalingCadenceRecord — mean RPM)
+        try {
+            val cc = client.readRecords(
+                ReadRecordsRequest(
+                    recordType = CyclingPedalingCadenceRecord::class,
+                    timeRangeFilter = window,
+                )
+            )
+            val samples = cc.records
+                .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
+                .flatMap { it.samples }
+            if (samples.isNotEmpty()) {
+                val avgRpm = samples.sumOf { it.revolutionsPerMinute } / samples.size
+                values += mapOf("type" to "meanCadence", "value" to avgRpm, "unit" to "rpm")
+            }
+        } catch (e: Exception) {
+            logger("readWorkouts: skipping Cadence aggregates: ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -889,6 +1168,14 @@ class HealthConnectManager(
         "vo2Max" -> Vo2MaxRecord::class
         "respiratoryRate" -> RespiratoryRateRecord::class
         "distanceCycling" -> DistanceRecord::class
+        // Time-series metrics written by third-party HC exporters (Peloton,
+        // Strava, Zwift, cycling computers, ...). These were previously
+        // absent from the read-type set, so the SDK never requested them
+        // even when HC had the data and the app had asked for them.
+        "power", "cyclingPower", "runningPower" -> PowerRecord::class
+        "speed", "cyclingSpeed", "runningSpeed" -> SpeedRecord::class
+        "totalCaloriesBurned", "totalEnergy" -> TotalCaloriesBurnedRecord::class
+        "cyclingPedalingCadence" -> CyclingPedalingCadenceRecord::class
         "workout" -> ExerciseSessionRecord::class
         "sleep" -> SleepSessionRecord::class
         else -> null
