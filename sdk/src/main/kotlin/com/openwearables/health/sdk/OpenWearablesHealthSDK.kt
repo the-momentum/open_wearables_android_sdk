@@ -4,6 +4,10 @@ import android.app.Activity
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import java.lang.ref.WeakReference
 
 /**
@@ -48,7 +52,13 @@ class OpenWearablesHealthSDK private constructor(
             dispatchers: DispatcherProvider = DefaultDispatcherProvider()
         ): OpenWearablesHealthSDK {
             return instance ?: synchronized(this) {
-                instance ?: OpenWearablesHealthSDK(context.applicationContext, dispatchers).also { instance = it }
+                instance ?: run {
+                    // Install client certificate for mTLS endpoints if one is
+                    // configured (KeyChain alias or assets-bundled .p12). No-op
+                    // otherwise.
+                    MtlsConfigurator.reload(context.applicationContext)
+                    OpenWearablesHealthSDK(context.applicationContext, dispatchers).also { instance = it }
+                }
             }
         }
 
@@ -120,6 +130,94 @@ class OpenWearablesHealthSDK private constructor(
     fun unregisterPermissionLauncher() {
         healthConnectManager.unregisterPermissionLauncher()
     }
+
+    // -----------------------------------------------------------------------
+    // mTLS client certificate (Android KeyChain)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Prompts the user to select a client certificate from the Android
+     * KeyChain. The selected alias is persisted; on subsequent app launches
+     * the SDK auto-installs it on the shared HTTP client. Requires an
+     * Activity reference set via [setActivity].
+     *
+     * @param onResult invoked with the selected alias, or null if the user
+     *   cancelled or no Activity is available. Called on a KeyChain-internal
+     *   thread.
+     */
+    fun pickClientCertificate(hostHint: String? = null, onResult: (alias: String?) -> Unit) {
+        val activity = activityRef?.get()
+        if (activity == null) {
+            logMessage("pickClientCertificate: no Activity available — call setActivity first")
+            onResult(null)
+            return
+        }
+        val effectiveHost = hostHint ?: host?.let { runCatching { java.net.URI(it).host }.getOrNull() }
+        KeyChainCertProvider.pickAlias(activity, effectiveHost) { alias ->
+            if (alias != null) {
+                MtlsConfigurator.reload(context)
+                logMessage("Selected client certificate alias: $alias")
+            } else {
+                logMessage("Client certificate selection cancelled")
+            }
+            onResult(alias)
+        }
+    }
+
+    /**
+     * Returns the currently selected KeyChain alias, or null if none has
+     * been picked. Use to show the current selection in a settings UI.
+     */
+    fun getClientCertificateAlias(): String? = KeyChainCertProvider.storedAlias(context)
+
+    /**
+     * Forgets the selected KeyChain alias and rebuilds the shared HTTP
+     * client without a client certificate. Subsequent requests will use
+     * plain TLS unless an assets-based fallback is configured.
+     */
+    fun clearClientCertificate() {
+        KeyChainCertProvider.storeAlias(context, null)
+        MtlsConfigurator.reload(context)
+        logMessage("Cleared client certificate")
+    }
+
+    /**
+     * Redeems an invitation code via `{host}/api/v1/invitation-code/redeem`.
+     * Goes through the SDK's shared OkHttp client, so the configured client
+     * certificate (if any) is presented during the TLS handshake.
+     *
+     * @return a map with `statusCode` (Int), `body` (String), and `data`
+     *   (Map<String, Any?> — parsed JSON, empty if non-JSON or missing).
+     */
+    suspend fun redeemInvitationCode(host: String, code: String): Map<String, Any?> =
+        withContext(dispatchers.io) {
+            val normalizedHost = host.trimEnd('/')
+            val url = "$normalizedHost/api/v1/invitation-code/redeem"
+            val payload = JSONObject().put("code", code).toString()
+            val request = Request.Builder()
+                .url(url)
+                .post(payload.toRequestBody("application/json".toMediaType()))
+                .build()
+            SyncManager.sharedHttpClient.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                val parsed: Map<String, Any?> = if (responseBody.isNotEmpty()) {
+                    runCatching {
+                        val obj = JSONObject(responseBody)
+                        obj.keys().asSequence().associateWith { key ->
+                            val v = obj.get(key)
+                            if (v == JSONObject.NULL) null else v
+                        }
+                    }.getOrDefault(emptyMap())
+                } else {
+                    emptyMap()
+                }
+                mapOf(
+                    "statusCode" to response.code,
+                    "body" to responseBody,
+                    "data" to parsed,
+                )
+            }
+        }
 
     // -----------------------------------------------------------------------
     // Configuration
