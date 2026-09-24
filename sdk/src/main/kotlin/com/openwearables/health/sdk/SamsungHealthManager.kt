@@ -782,7 +782,7 @@ class SamsungHealthManager(
     private fun convertWorkout(raw: HealthDataRecord): List<UnifiedWorkout>? {
         val source = buildUnifiedSource(raw)
         val zoneOffset = raw.zoneOffset
-        val exerciseType = raw.fields["EXERCISE_TYPE"]?.toString() ?: "UNKNOWN"
+        val exerciseType = SamsungExerciseType.toPayloadType(raw.fields["EXERCISE_TYPE"])
 
         val sessions = raw.fields["SESSIONS"] as? List<Map<String, Any?>> ?: emptyList()
         if (sessions.isEmpty()) {
@@ -1292,7 +1292,9 @@ class SamsungHealthManager(
     @Suppress("UNCHECKED_CAST")
     private fun extractExerciseFields(dp: HealthDataPoint): Map<String, Any?> {
         val fields = mutableMapOf<String, Any?>()
-        getFieldValue<Any>(DataTypes.EXERCISE, "EXERCISE_TYPE", dp)?.let { fields["EXERCISE_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
+        getFieldValue<Any>(DataTypes.EXERCISE, "EXERCISE_TYPE", dp)?.let {
+            fields["EXERCISE_TYPE"] = SamsungExerciseType.toPayloadType(it)
+        }
         getFieldValue<Float>(DataTypes.EXERCISE, "TOTAL_CALORIES", dp)?.let { fields["TOTAL_CALORIES"] = it }
         getFieldValue<Long>(DataTypes.EXERCISE, "TOTAL_DURATION", dp)?.let { fields["TOTAL_DURATION"] = it }
         getFieldValue<String>(DataTypes.EXERCISE, "CUSTOM_TITLE", dp)?.let { fields["CUSTOM_TITLE"] = it }
