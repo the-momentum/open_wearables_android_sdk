@@ -7,6 +7,7 @@ import android.os.Build
 import com.samsung.android.sdk.health.data.HealthDataService
 import com.samsung.android.sdk.health.data.HealthDataStore
 import com.samsung.android.sdk.health.data.DeviceManager
+import com.samsung.android.sdk.health.data.data.ChangeType
 import com.samsung.android.sdk.health.data.data.HealthDataPoint
 import com.samsung.android.sdk.health.data.data.DataSource
 import com.samsung.android.sdk.health.data.device.Device
@@ -15,6 +16,7 @@ import com.samsung.android.sdk.health.data.permission.AccessType
 import com.samsung.android.sdk.health.data.permission.Permission
 import com.samsung.android.sdk.health.data.request.DataType
 import com.samsung.android.sdk.health.data.request.DataTypes
+import com.samsung.android.sdk.health.data.request.InstantTimeFilter
 import com.samsung.android.sdk.health.data.request.LocalTimeFilter
 import com.samsung.android.sdk.health.data.request.Ordering
 import com.samsung.android.sdk.health.data.request.AggregateRequest
@@ -51,6 +53,9 @@ class SamsungHealthManager(
     companion object {
         private const val SAMSUNG_HEALTH_PACKAGE = "com.sec.android.app.shealth"
         private const val MIN_SAMSUNG_HEALTH_VERSION = 6030002
+        private const val CHANGE_CURSOR_PREFIX = "sht:"
+        private const val CHANGE_PAGE_PREFIX = "shp:"
+        private const val CHANGE_PAGE_SIZE = 1000
     }
 
     // -----------------------------------------------------------------------
@@ -62,8 +67,34 @@ class SamsungHealthManager(
     }
 
     override fun setTrackedTypes(typeIds: List<String>) {
-        trackedTypeIds = typeIds.filter { isSupportedType(it) }.toSet()
+        rememberTrackedTypes(typeIds)
+    }
+
+    /**
+     * Several requested ids read one Samsung record and emit the same samples
+     * (the three blood-pressure ids, the body-composition ids). Keeping all of
+     * them re-reads and re-uploads that record on every page.
+     */
+    private fun rememberTrackedTypes(typeIds: List<String>) {
+        val collapsed = collapseSamsungTypeIds(typeIds)
+        val readable = typeIds.count { isSupportedType(it) }
+        trackedTypeIds = collapsed.toSet()
         logger("Tracking ${trackedTypeIds.size} Samsung Health types: ${trackedTypeIds.joinToString()}")
+        val dropped = readable - collapsed.size
+        if (dropped > 0) {
+            logger("Reading each Samsung Health record once ($dropped alias type(s) share a record with another requested type)")
+        }
+    }
+
+    private fun collapseSamsungTypeIds(typeIds: List<String>): List<String> {
+        val seen = HashSet<String>()
+        val kept = ArrayList<String>()
+        for (id in typeIds) {
+            if (!isSupportedType(id)) continue
+            val key = (mapToDataType(id) ?: getAggregateConfig(id)?.dataType)?.javaClass?.name ?: continue
+            if (seen.add(key)) kept.add(id)
+        }
+        return kept
     }
 
     private fun isSupportedType(typeId: String): Boolean =
@@ -131,8 +162,111 @@ class SamsungHealthManager(
         deviceManager = null
     }
 
+    override fun supportsChangeTracking(): Boolean = true
+
+    override fun canTrackChanges(typeId: String): Boolean =
+        mapToDataType(typeId) is DataType.ChangeReadable<*>
+
+    override suspend fun mintChangeToken(typeId: String): String? {
+        if (!canTrackChanges(typeId)) return null
+        return "$CHANGE_CURSOR_PREFIX${System.currentTimeMillis()}"
+    }
+
+    /**
+     * Changes are filtered by when Samsung wrote them, not by the sample's
+     * start time, so a backfill with an older date is still returned.
+     * The stored cursor is that write-time. A page in progress keeps the
+     * Samsung page token inside the same window.
+     */
+    override suspend fun readChanges(typeId: String, token: String): ChangeReadResult =
+        withContext(dispatchers.io) {
+            val readable = mapToDataType(typeId) as? DataType.ChangeReadable<*>
+                ?: return@withContext ChangeReadResult.unavailable()
+            val cursor = parseSamsungChangeCursor(token)
+                ?: return@withContext ChangeReadResult.expired()
+            if (healthDataStore == null) connect()
+            val store = healthDataStore ?: return@withContext ChangeReadResult.unavailable()
+
+            val startMs = cursor.startMs
+            val endMs = cursor.endMs ?: System.currentTimeMillis()
+            if (cursor.pageToken == null && startMs >= endMs) {
+                return@withContext ChangeReadResult(nextToken = "$CHANGE_CURSOR_PREFIX$endMs")
+            }
+
+            var pageToken = cursor.pageToken
+            var deleted = 0
+            val points = mutableListOf<HealthDataPoint>()
+            var hasMore = false
+            try {
+                var guard = 0
+                while (guard++ < 50) {
+                    val builder = readable.changedDataRequestBuilder
+                    builder.setChangeTimeFilter(
+                        InstantTimeFilter.of(Instant.ofEpochMilli(startMs), Instant.ofEpochMilli(endMs))
+                    )
+                    builder.setPageSize(CHANGE_PAGE_SIZE)
+                    if (pageToken != null) builder.setPageToken(pageToken)
+                    val response = store.readChanges(builder.build())
+                    for (change in response.dataList) {
+                        when (change.changeType) {
+                            ChangeType.DELETE -> deleted++
+                            ChangeType.UPSERT -> (change.upsertDataPoint as? HealthDataPoint)?.let { points.add(it) }
+                        }
+                    }
+                    val nextPage = response.pageToken
+                    if (points.isNotEmpty() || nextPage == null) {
+                        hasMore = nextPage != null
+                        pageToken = nextPage
+                        break
+                    }
+                    pageToken = nextPage
+                }
+                if (guard >= 50 && pageToken != null && points.isEmpty()) hasMore = true
+            } catch (e: Exception) {
+                logger("  $typeId: readChanges failed: ${e.javaClass.simpleName}: ${e.message}")
+                return@withContext ChangeReadResult.unavailable()
+            }
+
+            val nextToken = if (hasMore && pageToken != null) {
+                "$CHANGE_PAGE_PREFIX$startMs:$endMs:$pageToken"
+            } else {
+                "$CHANGE_CURSOR_PREFIX$endMs"
+            }
+            if (points.isEmpty()) {
+                return@withContext ChangeReadResult(
+                    nextToken = nextToken, hasMore = hasMore, deletedCount = deleted,
+                )
+            }
+            val raw = points.mapNotNull { parseDataPoint(typeId, it) }
+            val converted = convertToUnified(typeId, filterImplausibleTimestamps(typeId, raw))
+            ChangeReadResult(
+                data = converted.data,
+                nextToken = nextToken,
+                hasMore = hasMore,
+                upsertCount = points.size,
+                deletedCount = deleted,
+            )
+        }
+
+    private data class SamsungChangeCursor(val startMs: Long, val endMs: Long?, val pageToken: String?)
+
+    private fun parseSamsungChangeCursor(token: String): SamsungChangeCursor? {
+        if (token.startsWith(CHANGE_PAGE_PREFIX)) {
+            val parts = token.removePrefix(CHANGE_PAGE_PREFIX).split(":", limit = 3)
+            if (parts.size < 3) return null
+            val start = parts[0].toLongOrNull() ?: return null
+            val end = parts[1].toLongOrNull() ?: return null
+            return SamsungChangeCursor(start, end, parts[2])
+        }
+        if (token.startsWith(CHANGE_CURSOR_PREFIX)) {
+            val start = token.removePrefix(CHANGE_CURSOR_PREFIX).toLongOrNull() ?: return null
+            return SamsungChangeCursor(start, null, null)
+        }
+        return null
+    }
+
     override suspend fun requestAuthorization(typeIds: List<String>): Boolean {
-        trackedTypeIds = typeIds.filter { isSupportedType(it) }.toSet()
+        rememberTrackedTypes(typeIds)
         val dataTypes = typeIds.mapNotNull { mapToDataType(it) }.toSet()
         if (dataTypes.isEmpty()) {
             logger("No valid Samsung Health types to authorize")

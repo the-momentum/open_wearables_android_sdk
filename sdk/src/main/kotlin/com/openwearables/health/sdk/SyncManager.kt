@@ -2,10 +2,20 @@ package com.openwearables.health.sdk
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.work.*
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -20,6 +30,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -30,7 +41,8 @@ data class TypeSyncProgress(
     var sentCount: Int = 0,
     var isComplete: Boolean = false,
     var pendingAnchorTimestamp: Long? = null,
-    var pendingOlderThan: Long? = null
+    var pendingOlderThan: Long? = null,
+    var pendingChangeToken: String? = null
 )
 
 @Serializable
@@ -89,6 +101,23 @@ class SyncManager(
             _sharedHttpClient = client
             return client
         }
+
+        private const val CATCHUP_TOKEN_PREFIX = "catchup:"
+
+        /** One sync per process. Workers construct their own [SyncManager]. */
+        internal val processSyncLock = AtomicBoolean(false)
+
+        /**
+         * Bumped when anchors are cleared. A sync that started earlier must not
+         * write its cursors back on top of the reset.
+         */
+        internal val syncEpoch = AtomicInteger(0)
+
+        /**
+         * Set when a run stops because Health Connect rejected a read.
+         * The worker that owns the run consumes this and delays the follow-up.
+         */
+        internal val quotaBackoffPending = AtomicBoolean(false)
     }
 
     private val syncPrefs: SharedPreferences by lazy {
@@ -106,6 +135,9 @@ class SyncManager(
             .withZone(java.time.ZoneOffset.UTC)
 
     private val isSyncing = AtomicBoolean(false)
+    private var runEpoch = 0
+
+    private fun writesAllowed(): Boolean = runEpoch == syncEpoch.get()
     private val tokenRefreshLock = ReentrantLock()
     private var isRefreshingToken = false
 
@@ -179,12 +211,15 @@ class SyncManager(
     // MARK: - Background Sync
 
     suspend fun startBackgroundSync(host: String, customSyncUrl: String?): Boolean {
-        schedulePeriodicSync(host, customSyncUrl)
-        scheduleExpeditedSync(host, customSyncUrl)
+        schedulePeriodicSync(host, customSyncUrl, replace = false)
         return true
     }
 
-    private fun schedulePeriodicSync(host: String, customSyncUrl: String?) {
+    /**
+     * @param replace `true` when the interval changed. Default `KEEP` so
+     * `configure` / app restart does not reset the 15-minute timer (#20).
+     */
+    private fun schedulePeriodicSync(host: String, customSyncUrl: String?, replace: Boolean = false) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
@@ -201,44 +236,70 @@ class SyncManager(
 
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             SyncDefaults.WORK_NAME_PERIODIC,
-            ExistingPeriodicWorkPolicy.UPDATE,
+            if (replace) ExistingPeriodicWorkPolicy.UPDATE else ExistingPeriodicWorkPolicy.KEEP,
             work
         )
         logger("Scheduled periodic sync every $syncIntervalMinutes minute(s)")
     }
 
-    fun scheduleExpeditedSync(host: String, customSyncUrl: String?) {
+    fun reschedulePeriodicSync(host: String, customSyncUrl: String?) {
+        schedulePeriodicSync(host, customSyncUrl, replace = true)
+    }
+
+    fun scheduleExpeditedSync(
+        host: String,
+        customSyncUrl: String?,
+        initialDelayMs: Long = 0L,
+    ) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
 
-        val expeditedWork = OneTimeWorkRequestBuilder<HealthSyncWorker>()
+        val builder = OneTimeWorkRequestBuilder<HealthSyncWorker>()
             .setConstraints(constraints)
-            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .setInputData(workDataOf(
                 HealthSyncWorker.KEY_HOST to host,
                 HealthSyncWorker.KEY_CUSTOM_SYNC_URL to customSyncUrl
             ))
-            .build()
+        if (initialDelayMs > 0L) {
+            builder.setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
+        } else {
+            builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+        }
+        val expeditedWork = builder.build()
 
         WorkManager.getInstance(context).enqueueUniqueWork(
             SyncDefaults.WORK_NAME_EXPEDITED, ExistingWorkPolicy.REPLACE, expeditedWork
         )
-        logger("Scheduled expedited sync")
+        if (initialDelayMs > 0L) {
+            logger("Scheduled sync in ${initialDelayMs / 1000}s (Health Connect rate limit)")
+        } else {
+            logger("Scheduled expedited sync")
+        }
     }
 
     suspend fun stopBackgroundSync() {
-        WorkManager.getInstance(context).cancelUniqueWork(SyncDefaults.WORK_NAME_PERIODIC)
-        logger("Cancelled periodic sync")
+        val wm = WorkManager.getInstance(context)
+        wm.cancelUniqueWork(SyncDefaults.WORK_NAME_PERIODIC)
+        wm.cancelUniqueWork(SyncDefaults.WORK_NAME_EXPEDITED)
+        logger("Cancelled periodic and expedited sync")
     }
 
     // MARK: - Sync Now
 
-    suspend fun syncNow(host: String, customSyncUrl: String?, fullExport: Boolean) {
-        if (!isSyncing.compareAndSet(false, true)) {
+    suspend fun syncNow(
+        host: String,
+        customSyncUrl: String?,
+        fullExport: Boolean,
+        background: Boolean = false,
+    ) {
+        if (!processSyncLock.compareAndSet(false, true)) {
             logger("Sync already in progress")
             return
         }
+        runEpoch = syncEpoch.get()
+        isSyncing.set(true)
+        quotaBackoffPending.set(false)
 
         try {
             val userId = secureStorage.getUserId()
@@ -286,8 +347,14 @@ class SyncManager(
                 fullSyncStartTime = syncStartTime
                 currentLogsEndpoint = logsEndpoint
                 try {
-                    logger("Counting records for sync start log...")
-                    val typeCounts = countRecordsForTypes(trackedTypes, floor)
+                    // Already-sent totals only. Paging the whole store here
+                    // burns the Health Connect request quota before any payload
+                    // is uploaded. A fresh session reports 0.
+                    val typeCounts = if (isResuming && existingState != null) {
+                        trackedTypes.associateWith { existingState.typeProgress[it]?.sentCount ?: 0 }
+                    } else {
+                        trackedTypes.associateWith { 0 }
+                    }
                     logger("Sending sync start log to $logsEndpoint")
                     sendSyncStartLog(logsEndpoint, trackedTypes, typeCounts, floor)
                 } catch (e: Exception) {
@@ -295,7 +362,9 @@ class SyncManager(
                 }
             }
 
-            val result = processTypesRoundRobin(trackedTypes, effectiveFullExport, endpoint)
+            val result = processTypesRoundRobin(
+                trackedTypes, effectiveFullExport, endpoint, background,
+            )
 
             if (effectiveFullExport && !result.completed) {
                 val durationMs = (System.currentTimeMillis() - syncStartTime).toInt()
@@ -310,6 +379,7 @@ class SyncManager(
             currentLogsEndpoint = null
         } finally {
             isSyncing.set(false)
+            processSyncLock.set(false)
         }
     }
 
@@ -324,16 +394,20 @@ class SyncManager(
         val count: Int = 0,
         val nextCursor: Long? = null,
         val anchorTimestamp: Long? = null,
-        val isDone: Boolean = false
+        val nextChangeToken: String? = null,
+        val isDone: Boolean = false,
+        val quotaExceeded: Boolean = false,
     )
 
     private suspend fun processTypesRoundRobin(
         types: List<String>,
         fullExport: Boolean,
-        endpoint: String
+        endpoint: String,
+        background: Boolean,
     ): RoundRobinResult {
         val olderThanCursors = mutableMapOf<String, Long?>()
         val anchorCursors = mutableMapOf<String, Long?>()
+        val changeTokens = mutableMapOf<String, String?>()
         val completedTypes = mutableSetOf<String>()
 
         stateMutex.withLock {
@@ -344,6 +418,7 @@ class SyncManager(
                     if (!progress.isComplete) {
                         progress.pendingOlderThan?.let { olderThanCursors[id] = it }
                         progress.pendingAnchorTimestamp?.let { anchorCursors[id] = it }
+                        progress.pendingChangeToken?.let { changeTokens[id] = it }
                     }
                 }
             }
@@ -351,9 +426,14 @@ class SyncManager(
 
         if (!fullExport) {
             val anchors = loadAnchors()
+            val storedTokens = loadChangeTokens()
             val floor = syncStartTimestamp()
             for (type in types) {
-                if (!completedTypes.contains(type) && !anchorCursors.containsKey(type)) {
+                if (completedTypes.contains(type)) continue
+                if (!changeTokens.containsKey(type)) {
+                    storedTokens[type]?.let { changeTokens[type] = it }
+                }
+                if (!anchorCursors.containsKey(type)) {
                     val storedAnchor = anchors[type]
                     val anchor = when {
                         storedAnchor != null && floor != null -> maxOf(storedAnchor, floor)
@@ -365,29 +445,60 @@ class SyncManager(
             }
         }
 
+        var loggedPageSize = -1
+        return coroutineScope syncRound@{
+        // Next page is read while the current one uploads. A failed upload
+        // cancels it; cursors are persisted only after a 2xx.
+        var prefetched: Deferred<List<FetchResult>>? = null
         while (true) {
             val incompleteTypes = types.filter { !completedTypes.contains(it) }
             if (incompleteTypes.isEmpty()) break
 
-            val perTypeLimit = maxOf(1, SyncDefaults.CHUNK_SIZE / incompleteTypes.size)
+            // The worker always asks for a background run. While the app is open,
+            // use the large page: Health Connect charges quota per request, so a
+            // 100-record page split across every type burns the limit on a handful
+            // of samples.
+            val smallPages = background && !isAppInForeground()
+            val chunkSize = if (smallPages) SyncDefaults.BACKGROUND_CHUNK_SIZE else SyncDefaults.CHUNK_SIZE
+            if (chunkSize != loggedPageSize) {
+                loggedPageSize = chunkSize
+                logger("Sync page size: $chunkSize${if (smallPages) " (app in background)" else ""}")
+            }
+            val perTypeLimit = maxOf(1, chunkSize / incompleteTypes.size)
 
-            // Phase 1: Fetch one chunk from each type (no network yet)
-            val roundResults = mutableListOf<FetchResult>()
+            // Phase 1: Fetch one chunk from each type (no network yet).
+            // Health Connect reads are cross-process; do not wait on them one by one.
+            val roundResults = prefetched?.await() ?: fetchTypesForRound(
+                incompleteTypes, fullExport, olderThanCursors, anchorCursors, changeTokens, perTypeLimit,
+            )
+            prefetched = null
 
-            for (type in incompleteTypes) {
-                val result = if (fullExport) {
-                    fetchOneChunkNewestFirst(type, olderThanCursors[type], perTypeLimit)
-                } else {
-                    fetchOneChunkIncremental(type, anchorCursors[type], perTypeLimit)
+            for (result in roundResults) {
+                if (result.quotaExceeded) {
+                    continue
                 }
-
-                roundResults.add(result)
-
                 if (result.isDone) {
-                    completedTypes.add(type)
+                    completedTypes.add(result.type)
                 } else {
-                    if (fullExport) olderThanCursors[type] = result.nextCursor
-                    else anchorCursors[type] = result.nextCursor
+                    if (fullExport) olderThanCursors[result.type] = result.nextCursor
+                    else {
+                        result.nextCursor?.let { anchorCursors[result.type] = it }
+                        result.nextChangeToken?.let { changeTokens[result.type] = it }
+                    }
+                }
+            }
+
+            val hitQuota = roundResults.any { it.quotaExceeded }
+
+            // Read the following page during the upload. Cursors above are already
+            // the next page; they are written to disk only after a 2xx.
+            val stillIncomplete = types.filter { !completedTypes.contains(it) }
+            if (!hitQuota && stillIncomplete.isNotEmpty()) {
+                val nextLimit = maxOf(1, chunkSize / stillIncomplete.size)
+                prefetched = async {
+                    fetchTypesForRound(
+                        stillIncomplete, fullExport, olderThanCursors, anchorCursors, changeTokens, nextLimit,
+                    )
                 }
             }
 
@@ -399,11 +510,14 @@ class SyncManager(
             )
 
             if (!mergedData.isEmpty) {
-                val payload = buildPayload(mergedData)
                 logPayloadSummary(mergedData)
-                val sendResult = sendPayload(endpoint, payload)
+                val uploadStarted = System.currentTimeMillis()
+                val sendResult = sendHealthData(endpoint, mergedData)
+                val uploadMs = System.currentTimeMillis() - uploadStarted
 
                 if (!sendResult.success) {
+                    prefetched?.cancel()
+                    prefetched = null
                     val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
                     logger("Combined round failed ($reason)")
                     val (totalSent, typeResults) = stateMutex.withLock {
@@ -415,25 +529,107 @@ class SyncManager(
                         }
                         Pair(sent, results)
                     }
-                    return RoundRobinResult(false, totalSent, typeResults)
+                    return@syncRound RoundRobinResult(false, totalSent, typeResults)
                 }
 
-                logger("Round sent: ${mergedData.totalCount} items (${sendResult.payloadSizeKb} KB) -> ${sendResult.statusCode}")
+                logger("Round sent: ${mergedData.totalCount} items (${sendResult.payloadSizeKb} KB) in ${uploadMs}ms -> ${sendResult.statusCode}")
             }
 
-            // Phase 3: Update progress for all types in this round
+            // Phase 3: Update progress for all types in this round.
+            // Full-export + change tracking: do not persist isComplete until
+            // Phase 4 mints a token. A failed mint leaves the type incomplete
+            // so the next incremental run cannot start from nil and re-crawl history.
             val newlyCompletedTypes = mutableListOf<Pair<String, Int>>()
+            val deferCompleteForToken = fullExport && healthProvider.supportsChangeTracking()
             stateMutex.withLock {
                 for (result in roundResults) {
-                    updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp)
-                    if (fullExport && !result.isDone) {
+                    val persistComplete = result.isDone && !deferCompleteForToken
+                    updateInMemoryProgress(
+                        result.type, result.count, isComplete = persistComplete,
+                        anchorTimestamp = result.anchorTimestamp,
+                        changeToken = result.nextChangeToken,
+                    )
+                    if (fullExport && !result.isDone && !result.quotaExceeded) {
                         inMemoryState?.typeProgress?.get(result.type)?.pendingOlderThan = result.nextCursor
                     }
-                    if (result.isDone) {
+                    if (!fullExport && !result.isDone) {
+                        result.nextChangeToken?.let {
+                            inMemoryState?.typeProgress?.get(result.type)?.pendingChangeToken = it
+                        }
+                    }
+                    if (persistComplete) {
                         newlyCompletedTypes.add(result.type to (inMemoryState?.typeProgress?.get(result.type)?.sentCount ?: 0))
                     }
                 }
                 persistStateToDisk()
+            }
+
+            if (hitQuota) {
+                prefetched?.cancel()
+                prefetched = null
+                logger("Health Connect rate limit — pausing sync, cursors unchanged for the rejected read")
+                quotaBackoffPending.set(true)
+                val (totalSent, typeResults) = stateMutex.withLock {
+                    val state = inMemoryState
+                    val sent = state?.totalSentCount ?: 0
+                    val results = types.map { type ->
+                        TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
+                    }
+                    Pair(sent, results)
+                }
+                return@syncRound RoundRobinResult(false, totalSent, typeResults)
+            }
+
+            // Phase 4: mint HC change tokens after a successful upload.
+            // A failed mint pauses the sync instead of pretending the type is done.
+            if (deferCompleteForToken) {
+                val doneThisRound = roundResults.filter { it.isDone }
+                for (done in doneThisRound) {
+                    if (!healthProvider.canTrackChanges(done.type)) {
+                        logger("  ${done.type}: no change stream, marking complete")
+                        stateMutex.withLock {
+                            updateInMemoryProgress(
+                                done.type, sentInChunk = 0, isComplete = true,
+                                anchorTimestamp = null, changeToken = null,
+                            )
+                            persistStateToDisk()
+                            newlyCompletedTypes.add(
+                                done.type to (inMemoryState?.typeProgress?.get(done.type)?.sentCount ?: 0)
+                            )
+                        }
+                        continue
+                    }
+                    val minted = healthProvider.mintChangeToken(done.type)
+                    if (minted == null) {
+                        prefetched?.cancel()
+                        prefetched = null
+                        logger("  ${done.type}: change token mint failed — leaving type incomplete, pausing sync")
+                        completedTypes.remove(done.type)
+                        stateMutex.withLock {
+                            inMemoryState?.completedTypes?.remove(done.type)
+                            inMemoryState?.typeProgress?.get(done.type)?.isComplete = false
+                            persistStateToDisk()
+                        }
+                        val (totalSent, typeResults) = stateMutex.withLock {
+                            val state = inMemoryState
+                            val sent = state?.totalSentCount ?: 0
+                            val results = types.map { type ->
+                                TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
+                            }
+                            Pair(sent, results)
+                        }
+                        return@syncRound RoundRobinResult(false, totalSent, typeResults)
+                    }
+                    logger("  ${done.type}: captured change token after full export")
+                    stateMutex.withLock {
+                        updateInMemoryProgress(
+                            done.type, sentInChunk = 0, isComplete = true,
+                            anchorTimestamp = null, changeToken = minted,
+                        )
+                        persistStateToDisk()
+                        newlyCompletedTypes.add(done.type to (inMemoryState?.typeProgress?.get(done.type)?.sentCount ?: 0))
+                    }
+                }
             }
 
             val startTime = fullSyncStartTime
@@ -443,10 +639,12 @@ class SyncManager(
                     if (count > 0) {
                         val durationMs = (System.currentTimeMillis() - startTime).toInt()
                         logger("Sending sync end log: ${payloadTypeName(type)} ($count records, ${durationMs}ms)")
-                        try {
-                            sendTypeEndLog(logEndpoint, type, true, count, durationMs)
-                        } catch (e: Exception) {
-                            logger("Type end log failed for $type: ${e.message}")
+                        launch {
+                            try {
+                                sendTypeEndLog(logEndpoint, type, true, count, durationMs)
+                            } catch (e: Exception) {
+                                logger("Type end log failed for $type: ${e.message}")
+                            }
                         }
                     }
                 }
@@ -460,14 +658,61 @@ class SyncManager(
                 TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
             }
             if (state?.fullExport == true) markFullExportDone()
-            if (state != null) logger("Sync: complete ($sent items, ${state.completedTypes.size} types)")
+            if (state != null) {
+                logger("Sync: complete ($sent items, ${state.completedTypes.size} types)")
+                if (state.fullExport && sent == 0) {
+                    logger("Full export found 0 records from ${healthProvider.providerName}. If the wearable writes to Health Connect, set provider to google.")
+                }
+            }
             clearSyncSessionInternal()
             Pair(sent, results)
         }
-        return RoundRobinResult(true, totalSent, typeResults)
+        RoundRobinResult(true, totalSent, typeResults)
+        }
+    }
+
+    /** True when the process has a started activity. Workers still pass background=true. */
+    private fun isAppInForeground(): Boolean = try {
+        ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+    } catch (_: Exception) {
+        false
     }
 
     // MARK: - Fetch-Only Chunk Processors (no network)
+
+    private suspend fun fetchTypesForRound(
+        types: List<String>,
+        fullExport: Boolean,
+        olderThanCursors: Map<String, Long?>,
+        anchorCursors: Map<String, Long?>,
+        changeTokens: Map<String, String?>,
+        perTypeLimit: Int,
+    ): List<FetchResult> {
+        suspend fun fetch(type: String): FetchResult = if (fullExport) {
+            fetchOneChunkNewestFirst(type, olderThanCursors[type], perTypeLimit)
+        } else {
+            fetchOneChunkIncremental(type, anchorCursors[type], changeTokens[type], perTypeLimit)
+        }
+
+        if (!healthProvider.supportsParallelReads() || types.size <= 1) {
+            val results = ArrayList<FetchResult>(types.size)
+            for (type in types) {
+                val result = fetch(type)
+                results.add(result)
+                if (result.quotaExceeded) break
+            }
+            return results
+        }
+
+        val gate = Semaphore(4)
+        return coroutineScope {
+            types.map { type ->
+                async {
+                    gate.withPermit { fetch(type) }
+                }
+            }.awaitAll()
+        }
+    }
 
     private suspend fun fetchOneChunkNewestFirst(
         type: String,
@@ -480,6 +725,11 @@ class SyncManager(
         logger("  $type: querying (newest first, limit=$limit${olderThan?.let { ", olderThan=${java.time.Instant.ofEpochMilli(it)}" } ?: ""})...")
 
         val result = healthProvider.readDataDescending(type, olderThan, limit)
+
+        if (result.quotaExceeded) {
+            logger("  $type: rate limited — leaving cursor unchanged")
+            return FetchResult(type = type, quotaExceeded = true)
+        }
 
         if (result.data.isEmpty) {
             logger("  $type: all data sent (newest first)")
@@ -510,6 +760,92 @@ class SyncManager(
     private suspend fun fetchOneChunkIncremental(
         type: String,
         anchor: Long?,
+        changeToken: String?,
+        limit: Int
+    ): FetchResult {
+        if (healthProvider.supportsChangeTracking()) {
+            return fetchOneChunkFromChanges(type, changeToken, limit, catchupSince = anchor)
+        }
+        return fetchOneChunkFromTimestamp(type, anchor, limit)
+    }
+
+    /**
+     * Health Connect incremental: write-order [HealthDataProvider.readChanges].
+     * A missing or expired token is minted at "now" and
+     * we do a one-time [SyncDefaults.CHANGE_CATCHUP_MS] time-range catch-up so upgrades
+     * and token expiry do not skip recent backfills.
+     *
+     * [catchupSince] is the in-memory page cursor for a multi-page catch-up.
+     * The first mint always looks back [SyncDefaults.CHANGE_CATCHUP_MS] — never
+     * the old timestamp anchor, which is the #19 bug.
+     */
+    private suspend fun fetchOneChunkFromChanges(
+        type: String,
+        changeToken: String?,
+        limit: Int,
+        catchupSince: Long? = null,
+    ): FetchResult {
+        val token = changeToken
+        if (token == null || token.startsWith(CATCHUP_TOKEN_PREFIX)) {
+            val realToken = token?.removePrefix(CATCHUP_TOKEN_PREFIX)
+                ?: healthProvider.mintChangeToken(type)
+            if (realToken == null) {
+                logger("  $type: could not mint change token, falling back to timestamp")
+                return fetchOneChunkFromTimestamp(type, catchupSince ?: loadAnchors()[type], limit)
+            }
+            val since = if (token != null && token.startsWith(CATCHUP_TOKEN_PREFIX)) {
+                catchupSince ?: (System.currentTimeMillis() - SyncDefaults.CHANGE_CATCHUP_MS)
+            } else {
+                System.currentTimeMillis() - SyncDefaults.CHANGE_CATCHUP_MS
+            }
+            logger("  $type: change-token catch-up since ${java.time.Instant.ofEpochMilli(since)}")
+            val result = healthProvider.readData(type, since, limit)
+            if (result.quotaExceeded) {
+                logger("  $type: rate limited during catch-up — leaving cursor unchanged")
+                return FetchResult(type = type, quotaExceeded = true)
+            }
+            val count = result.data.totalCount
+            val isLastChunk = count < limit
+            if (result.data.isEmpty) {
+                logger("  $type: catch-up empty")
+                return FetchResult(type = type, nextChangeToken = realToken, isDone = true)
+            }
+            logger("  $type: catch-up $count samples")
+            return FetchResult(
+                type = type, data = result.data, count = count,
+                nextCursor = result.maxTimestamp,
+                anchorTimestamp = result.maxTimestamp,
+                nextChangeToken = if (isLastChunk) realToken else CATCHUP_TOKEN_PREFIX + realToken,
+                isDone = isLastChunk
+            )
+        }
+
+        logger("  $type: querying changes...")
+        val changes = healthProvider.readChanges(type, token)
+        if (changes.tokenExpired) {
+            logger("  $type: change token expired — reminting + 30-day catch-up")
+            return fetchOneChunkFromChanges(type, changeToken = null, limit = limit, catchupSince = null)
+        }
+
+        val deletedNote = if (changes.deletedCount > 0) ", ${changes.deletedCount} deleted" else ""
+        if (changes.data.isEmpty) {
+            logger("  $type: no new data$deletedNote")
+            return FetchResult(type = type, nextChangeToken = changes.nextToken ?: token, isDone = true)
+        }
+
+        val count = changes.data.totalCount
+        val isLastChunk = !changes.hasMore
+        logger("  $type: $count samples$deletedNote")
+        return FetchResult(
+            type = type, data = changes.data, count = count,
+            nextChangeToken = changes.nextToken ?: token,
+            isDone = isLastChunk
+        )
+    }
+
+    private suspend fun fetchOneChunkFromTimestamp(
+        type: String,
+        anchor: Long?,
         limit: Int
     ): FetchResult {
         logger("  $type: querying (limit=$limit)...")
@@ -533,27 +869,99 @@ class SyncManager(
         )
     }
 
-    private fun updateInMemoryProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Boolean, anchorTimestamp: Long?) {
+    private fun updateInMemoryProgress(
+        typeIdentifier: String,
+        sentInChunk: Int,
+        isComplete: Boolean,
+        anchorTimestamp: Long?,
+        changeToken: String? = null,
+    ) {
         val state = inMemoryState ?: return
         val progress = state.typeProgress.getOrPut(typeIdentifier) { TypeSyncProgress(typeIdentifier) }
         progress.sentCount += sentInChunk
         progress.isComplete = isComplete
         if (anchorTimestamp != null) progress.pendingAnchorTimestamp = anchorTimestamp
+        if (changeToken != null) progress.pendingChangeToken = changeToken
         state.totalSentCount += sentInChunk
         if (isComplete) {
             state.completedTypes.add(typeIdentifier)
             progress.pendingAnchorTimestamp?.let { saveAnchor(typeIdentifier, it) }
+            progress.pendingChangeToken?.let { saveChangeToken(typeIdentifier, it) }
         }
     }
 
     // MARK: - Payload (unified)
 
-    private fun buildPayload(data: UnifiedHealthData): Map<String, Any> = mapOf(
-        "provider" to healthProvider.providerId,
-        "sdkVersion" to SyncDefaults.SDK_VERSION,
-        "syncTimestamp" to UnifiedTimestamp.fromEpochMs(System.currentTimeMillis()),
-        "data" to data.toDataMap()
-    )
+    /**
+     * Encodes one round straight to bytes. Building [UnifiedHealthData.toDataMap]
+     * first copies every record into a Map tree (several MB per page) and the
+     * collector pauses the upload. Workouts and sleep stay on their maps —
+     * a page has few of them. The byte array sets Content-Length and can be
+     * replayed after a 401.
+     */
+    private fun encodeHealthPayload(data: UnifiedHealthData): ByteArray {
+        val out = java.io.ByteArrayOutputStream(64 * 1024)
+        val writer = android.util.JsonWriter(java.io.OutputStreamWriter(out, Charsets.UTF_8))
+        writer.beginObject()
+        writer.name("provider").value(healthProvider.providerId)
+        writer.name("sdkVersion").value(SyncDefaults.SDK_VERSION)
+        writer.name("syncTimestamp").value(UnifiedTimestamp.fromEpochMs(System.currentTimeMillis()))
+        writer.name("data")
+        writer.beginObject()
+        writer.name("records")
+        writer.beginArray()
+        for (record in data.records) writeRecord(writer, record)
+        writer.endArray()
+        writer.name("workouts")
+        writeValue(writer, data.workouts.map { it.toMap() })
+        writer.name("sleep")
+        writeValue(writer, data.sleep.map { it.toMap() })
+        writer.endObject()
+        writer.endObject()
+        writer.flush()
+        return out.toByteArray()
+    }
+
+    private fun writeRecord(writer: android.util.JsonWriter, record: UnifiedRecord) {
+        writer.beginObject()
+        writer.name("id").value(record.id)
+        writer.name("type").value(record.type)
+        writer.name("startDate").value(record.startDate)
+        writer.name("endDate").value(record.endDate)
+        writer.name("zoneOffset")
+        writeNullableString(writer, record.zoneOffset)
+        writer.name("source")
+        writeSource(writer, record.source)
+        writer.name("value").value(record.value)
+        writer.name("unit").value(record.unit)
+        writer.name("parentId")
+        writeNullableString(writer, record.parentId)
+        writer.name("metadata")
+        writeValue(writer, record.metadata)
+        writer.endObject()
+    }
+
+    private fun writeSource(writer: android.util.JsonWriter, source: UnifiedSource) {
+        writer.beginObject()
+        writer.name("appId"); writeNullableString(writer, source.appId)
+        writer.name("deviceId"); writeNullableString(writer, source.deviceId)
+        writer.name("deviceName"); writeNullableString(writer, source.deviceName)
+        writer.name("deviceManufacturer"); writeNullableString(writer, source.deviceManufacturer)
+        writer.name("deviceModel"); writeNullableString(writer, source.deviceModel)
+        writer.name("deviceType"); writeNullableString(writer, source.deviceType)
+        writer.name("recordingMethod"); writeNullableString(writer, source.recordingMethod)
+        writer.endObject()
+    }
+
+    private fun writeNullableString(writer: android.util.JsonWriter, value: String?) {
+        if (value == null) writer.nullValue() else writer.value(value)
+    }
+
+    private suspend fun sendHealthData(endpoint: String, data: UnifiedHealthData): SendResult {
+        val bytes = withContext(dispatchers.io) { encodeHealthPayload(data) }
+        val body = bytes.toRequestBody("application/json".toMediaType())
+        return sendWithBody(endpoint, body, AtomicLong(bytes.size.toLong()))
+    }
 
     // MARK: - Payload Summary Logging
 
@@ -858,29 +1266,6 @@ class SyncManager(
         )
     }
 
-    private suspend fun countRecordsForTypes(types: List<String>, sinceTimestamp: Long?): Map<String, Int> {
-        val counts = mutableMapOf<String, Int>()
-        val pageSize = 5000  // Health Connect caps readRecords pageSize at 5000.
-        for (type in types) {
-            try {
-                var count = 0
-                var cursor = sinceTimestamp
-                while (true) {
-                    val result = healthProvider.readData(type, cursor, pageSize)
-                    count += result.data.totalCount
-                    if (result.data.totalCount < pageSize || result.maxTimestamp == null) break
-                    cursor = result.maxTimestamp
-                }
-                counts[type] = count
-            } catch (e: Exception) {
-                logger("Count failed for $type: ${e.message}")
-                counts[type] = 0
-            }
-        }
-        logger("Record counts: ${counts.entries.filter { it.value > 0 }.joinToString { "${it.key}=${it.value}" }}")
-        return counts
-    }
-
     private suspend fun sendSyncStartLog(logsEndpoint: String, types: List<String>, typeCounts: Map<String, Int>, startTimestamp: Long?) {
         val dataTypeCounts = types.map { mapOf("type" to payloadTypeName(it), "count" to (typeCounts[it] ?: 0)) }
 
@@ -970,6 +1355,7 @@ class SyncManager(
     }
 
     private fun saveAnchor(type: String, timestamp: Long) {
+        if (!writesAllowed()) return
         val current = loadAnchors().toMutableMap()
         current[type] = timestamp
         syncPrefs.edit().putString(
@@ -978,18 +1364,44 @@ class SyncManager(
         ).apply()
     }
 
+    private fun loadChangeTokens(): Map<String, String> {
+        val jsonStr = syncPrefs.getString(StorageKeys.KEY_CHANGE_TOKENS, null) ?: return emptyMap()
+        return try {
+            json.decodeFromString<Map<String, String>>(jsonStr)
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    private fun saveChangeToken(type: String, token: String) {
+        if (!writesAllowed()) return
+        if (token.startsWith(CATCHUP_TOKEN_PREFIX)) return
+        val current = loadChangeTokens().toMutableMap()
+        current[type] = token
+        syncPrefs.edit().putString(StorageKeys.KEY_CHANGE_TOKENS, json.encodeToString(current)).apply()
+    }
+
     fun resetAnchors() {
-        syncPrefs.edit()
-            .remove(StorageKeys.KEY_ANCHORS)
-            .putBoolean(fullDoneKey(), false)
-            .apply()
-        clearSyncSession()
+        runBlocking {
+            stateMutex.withLock {
+                syncEpoch.incrementAndGet()
+                syncPrefs.edit()
+                    .remove(StorageKeys.KEY_ANCHORS)
+                    .remove(StorageKeys.KEY_CHANGE_TOKENS)
+                    .putBoolean(fullDoneKey(), false)
+                    .commit()
+                clearSyncSessionInternal()
+            }
+        }
         logger("Anchors reset - will perform full sync on next sync")
     }
 
     private fun fullDoneKey(): String = "fullDone.${userKey()}"
+    fun hasCompletedInitialExport(): Boolean = hasCompletedInitialSync()
+
     private fun hasCompletedInitialSync(): Boolean = syncPrefs.getBoolean(fullDoneKey(), false)
-    private fun markFullExportDone() { syncPrefs.edit().putBoolean(fullDoneKey(), true).apply() }
+    private fun markFullExportDone() {
+        if (!writesAllowed()) return
+        syncPrefs.edit().putBoolean(fullDoneKey(), true).apply()
+    }
 
     // MARK: - Sync State (Mutex-protected disk I/O)
 
@@ -997,6 +1409,7 @@ class SyncManager(
     private fun syncStateFile(): File = File(syncStateDir(), StorageKeys.SYNC_STATE_FILE)
 
     private fun persistStateToDisk() {
+        if (!writesAllowed()) return
         val state = inMemoryState ?: return
         try {
             val jsonStr = json.encodeToString(state)

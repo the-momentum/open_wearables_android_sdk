@@ -167,7 +167,9 @@ data class UnifiedHealthData(
 data class ProviderReadResult(
     val data: UnifiedHealthData,
     val maxTimestamp: Long?,
-    val minTimestamp: Long? = null
+    val minTimestamp: Long? = null,
+    /** Health Connect rejected the read. Empty data here is not "no more records". */
+    val quotaExceeded: Boolean = false,
 )
 
 // ---------------------------------------------------------------------------

@@ -75,4 +75,46 @@ interface HealthDataProvider {
         olderThanTimestamp: Long? = null,
         limit: Int = 1000
     ): ProviderReadResult = ProviderReadResult(UnifiedHealthData(), null, null)
+
+    /**
+     * Whether incremental sync follows writes (Health Connect `getChanges`,
+     * Samsung `readChanges`) instead of the record's start time.
+     */
+    fun supportsChangeTracking(): Boolean = false
+
+    /**
+     * Concurrent [readDataDescending] calls are safe. Health Connect reads
+     * cross process, so a round of many types should not wait on each one.
+     */
+    fun supportsParallelReads(): Boolean = false
+
+    /**
+     * Whether [typeId] has a change-token stream. Types the provider cannot
+     * read complete without one and must not pause the sync.
+     */
+    fun canTrackChanges(typeId: String): Boolean = supportsChangeTracking()
+
+    /** Mint a change token at "now" so later [readChanges] sees only subsequent writes. */
+    suspend fun mintChangeToken(typeId: String): String? = null
+
+    /**
+     * Read one page of insertions since [token], in write order. Backfilled
+     * records (old `startTime`, new insert) are included. See #19.
+     */
+    suspend fun readChanges(typeId: String, token: String): ChangeReadResult =
+        ChangeReadResult.unavailable()
+}
+
+data class ChangeReadResult(
+    val data: UnifiedHealthData = UnifiedHealthData(),
+    val nextToken: String? = null,
+    val hasMore: Boolean = false,
+    val upsertCount: Int = 0,
+    val deletedCount: Int = 0,
+    val tokenExpired: Boolean = false,
+) {
+    companion object {
+        fun unavailable() = ChangeReadResult()
+        fun expired() = ChangeReadResult(tokenExpired = true)
+    }
 }
