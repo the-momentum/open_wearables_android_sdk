@@ -73,7 +73,7 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
 
-val publishVersion = (findProperty("localPublishVersion") as String?) ?: "0.12.0"
+val publishVersion = (findProperty("localPublishVersion") as String?) ?: "0.13.0"
 
 afterEvaluate {
     publishing {

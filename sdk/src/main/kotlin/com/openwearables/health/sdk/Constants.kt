@@ -29,7 +29,7 @@ object SyncDefaults {
     const val CHANGE_CATCHUP_MS = 30L * 24 * 60 * 60 * 1000
     const val WORK_NAME_PERIODIC = "health_sync_periodic"
     const val WORK_NAME_EXPEDITED = "health_sync_expedited"
-    const val SDK_VERSION = "0.12.0"
+    const val SDK_VERSION = "0.13.0"
 }
 
 object StorageKeys {
