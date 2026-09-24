@@ -1272,14 +1272,14 @@ class SamsungHealthManager(
 
     private fun extractBodyCompositionFields(dp: HealthDataPoint): Map<String, Any?> {
         val fields = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "WEIGHT", dp)?.let { fields["WEIGHT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "HEIGHT", dp)?.let { fields["HEIGHT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT", dp)?.let { fields["BODY_FAT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT_MASS", dp)?.let { fields["BODY_FAT_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "FAT_FREE_MASS", dp)?.let { fields["FAT_FREE_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "SKELETAL_MUSCLE_MASS", dp)?.let { fields["SKELETAL_MUSCLE_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BMI", dp)?.let { fields["BMI"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BASAL_METABOLIC_RATE", dp)?.let { fields["BASAL_METABOLIC_RATE"] = it }
+        // Samsung returns these as Integer or Float. A Float-only read throws
+        // and parseDataPoint drops the whole record (#26).
+        listOf(
+            "WEIGHT", "HEIGHT", "BODY_FAT", "BODY_FAT_MASS",
+            "FAT_FREE_MASS", "SKELETAL_MUSCLE_MASS", "BMI", "BASAL_METABOLIC_RATE",
+        ).forEach { name ->
+            getNumberField(DataTypes.BODY_COMPOSITION, name, dp)?.let { fields[name] = it }
+        }
         return fields
     }
 
@@ -1378,6 +1378,10 @@ class SamsungHealthManager(
             getValueMethod.invoke(dataPoint, field) as? T
         } catch (_: Exception) { null }
     }
+
+    /** Integer, Float, Double, and Long are all valid Samsung numeric fields. */
+    private fun getNumberField(dataType: DataType, fieldName: String, dataPoint: HealthDataPoint): Number? =
+        getFieldValue<Any>(dataType, fieldName, dataPoint) as? Number
 }
 
 private data class CachedSamsungDevice(
