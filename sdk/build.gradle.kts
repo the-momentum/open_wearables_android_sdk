@@ -73,6 +73,8 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
 
+val publishVersion = (findProperty("localPublishVersion") as String?) ?: "0.13.0"
+
 afterEvaluate {
     publishing {
         publications {
@@ -80,7 +82,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.openwearables.health"
                 artifactId = "sdk"
-                version = "0.12.0"
+                version = publishVersion
 
                 pom {
                     name.set("Open Wearables Health SDK")

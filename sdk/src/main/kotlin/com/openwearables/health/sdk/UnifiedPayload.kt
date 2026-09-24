@@ -167,7 +167,9 @@ data class UnifiedHealthData(
 data class ProviderReadResult(
     val data: UnifiedHealthData,
     val maxTimestamp: Long?,
-    val minTimestamp: Long? = null
+    val minTimestamp: Long? = null,
+    /** Health Connect rejected the read. Empty data here is not "no more records". */
+    val quotaExceeded: Boolean = false,
 )
 
 // ---------------------------------------------------------------------------
@@ -189,13 +191,40 @@ object UnifiedTimestamp {
 // ---------------------------------------------------------------------------
 
 object DeviceTypeMapper {
-    fun fromSamsungDeviceType(type: String?): String? = when (type?.uppercase()) {
-        "MOBILE" -> "phone"
-        "WATCH" -> "watch"
-        "RING" -> "ring"
-        "BAND" -> "fitness_band"
-        "ACCESSORY" -> "unknown"
-        else -> null
+    /**
+     * Maps a Samsung [DeviceGroup] name to the unified device type.
+     *
+     * Samsung often reports a Galaxy Watch as [MOBILE] (sleep and other
+     * records are assembled on the phone). When the group is MOBILE / unknown,
+     * fall back to [name] / [model] so Watch7 (`SM-L315F`) is `watch`, not
+     * `phone`. See #29.
+     */
+    fun fromSamsungDeviceType(
+        type: String?,
+        name: String? = null,
+        model: String? = null,
+    ): String? {
+        val inferred = inferSamsungWearable(name, model)
+        return when (type?.uppercase()) {
+            "WATCH" -> "watch"
+            "RING" -> "ring"
+            "BAND" -> "fitness_band"
+            "MOBILE" -> inferred ?: "phone"
+            "ACCESSORY" -> inferred ?: "unknown"
+            else -> inferred
+        }
+    }
+
+    internal fun inferSamsungWearable(name: String?, model: String?): String? {
+        val n = name?.lowercase().orEmpty()
+        val m = model?.uppercase()?.replace(" ", "").orEmpty()
+        if (n.contains("ring")) return "ring"
+        if (n.contains("fit") && !n.contains("watch")) return "fitness_band"
+        if (n.contains("watch")) return "watch"
+        // SM-L is the Watch7 / Ultra / Watch8 prefix. SM-R is not watches-only
+        // (Fit, Buds, Gear VR) so it is never used as a fallback.
+        if (m.startsWith("SM-L")) return "watch"
+        return null
     }
 
     fun fromHealthConnectDeviceType(type: Int): String? = when (type) {

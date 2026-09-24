@@ -17,8 +17,12 @@
         Console explaining why background health data access is necessary.
         If denied, the SDK will still work but only read data while the app
         is in the foreground. Handle the permission-denied case gracefully.
+
+        READ_HEALTH_DATA_HISTORY is required to read records older than 30 days.
+        Without it Health Connect silently returns only the recent window.
     -->
     <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_HISTORY" />
     <uses-permission android:name="android.permission.health.READ_STEPS" />
     <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
     <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE" />
@@ -40,6 +44,10 @@
     <uses-permission android:name="android.permission.health.READ_RESPIRATORY_RATE" />
     <uses-permission android:name="android.permission.health.READ_EXERCISE" />
     <uses-permission android:name="android.permission.health.READ_SLEEP" />
+    <uses-permission android:name="android.permission.health.READ_POWER" />
+    <uses-permission android:name="android.permission.health.READ_SPEED" />
+    <uses-permission android:name="android.permission.health.READ_TOTAL_CALORIES_BURNED" />
+    <uses-permission android:name="android.permission.health.READ_CYCLING_PEDALING_CADENCE" />
 
     <!-- Package visibility: allow detecting Health Connect and Samsung Health on Android 11+ -->
     <queries>

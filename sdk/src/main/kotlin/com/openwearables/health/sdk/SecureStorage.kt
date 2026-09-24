@@ -9,7 +9,7 @@ import java.security.KeyStore
 
 /**
  * Secure storage for credentials using EncryptedSharedPreferences.
- * Mirrors the iOS Keychain-based storage approach.
+ * Encrypted credential storage.
  *
  * If EncryptedSharedPreferences fails to initialize (e.g. corrupted KeyStore),
  * the class attempts to clear corrupted keys and retry before throwing. It does
@@ -274,7 +274,13 @@ class SecureStorage(private val context: Context) {
             .remove(KEY_API_KEY)
             .commit()
 
+        // Provider is a device choice, not session state. Wiping it made the
+        // next configure() auto-pick Samsung Health while the app still showed
+        // the provider the user had selected.
+        val provider = getProvider()
         configPrefs.edit().clear().commit()
-        configPrefs.edit().putBoolean(KEY_APP_INSTALLED, true).commit()
+        val editor = configPrefs.edit().putBoolean(KEY_APP_INSTALLED, true)
+        if (provider != null) editor.putString(KEY_HEALTH_PROVIDER, provider)
+        editor.commit()
     }
 }

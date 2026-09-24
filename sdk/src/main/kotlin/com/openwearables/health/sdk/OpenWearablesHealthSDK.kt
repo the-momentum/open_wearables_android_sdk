@@ -3,8 +3,17 @@ package com.openwearables.health.sdk
 import android.app.Activity
 import android.content.Context
 import android.util.Log
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import kotlinx.coroutines.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import java.lang.ref.WeakReference
+import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /**
  * Controls which log messages the SDK emits.
@@ -48,7 +57,16 @@ class OpenWearablesHealthSDK private constructor(
             dispatchers: DispatcherProvider = DefaultDispatcherProvider()
         ): OpenWearablesHealthSDK {
             return instance ?: synchronized(this) {
-                instance ?: OpenWearablesHealthSDK(context.applicationContext, dispatchers).also { instance = it }
+                instance ?: run {
+                    // Install client certificate for mTLS endpoints if one is
+                    // configured (KeyChain alias or assets-bundled .p12). No-op
+                    // otherwise.
+                    MtlsConfigurator.reload(context.applicationContext)
+                    OpenWearablesHealthSDK(context.applicationContext, dispatchers).also {
+                        instance = it
+                        it.registerLifecycleObserver()
+                    }
+                }
             }
         }
 
@@ -107,6 +125,14 @@ class OpenWearablesHealthSDK private constructor(
     // Coroutine scope — recreated if destroy() was called
     private var scope = CoroutineScope(dispatchers.main + SupervisorJob())
 
+    // Resume interrupted work when the process becomes active, without requiring
+    // the host to call [onForeground].
+    private var lifecycleRegistered = false
+    private val lifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) = onForeground()
+        override fun onStop(owner: LifecycleOwner) = onBackground()
+    }
+
     // -----------------------------------------------------------------------
     // Activity
     // -----------------------------------------------------------------------
@@ -120,6 +146,94 @@ class OpenWearablesHealthSDK private constructor(
     fun unregisterPermissionLauncher() {
         healthConnectManager.unregisterPermissionLauncher()
     }
+
+    // -----------------------------------------------------------------------
+    // mTLS client certificate (Android KeyChain)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Prompts the user to select a client certificate from the Android
+     * KeyChain. The selected alias is persisted; on subsequent app launches
+     * the SDK auto-installs it on the shared HTTP client. Requires an
+     * Activity reference set via [setActivity].
+     *
+     * @param onResult invoked with the selected alias, or null if the user
+     *   cancelled or no Activity is available. Called on a KeyChain-internal
+     *   thread.
+     */
+    fun pickClientCertificate(hostHint: String? = null, onResult: (alias: String?) -> Unit) {
+        val activity = activityRef?.get()
+        if (activity == null) {
+            logMessage("pickClientCertificate: no Activity available — call setActivity first")
+            onResult(null)
+            return
+        }
+        val effectiveHost = hostHint ?: host?.let { runCatching { java.net.URI(it).host }.getOrNull() }
+        KeyChainCertProvider.pickAlias(activity, effectiveHost) { alias ->
+            if (alias != null) {
+                MtlsConfigurator.reload(context)
+                logMessage("Selected client certificate alias: $alias")
+            } else {
+                logMessage("Client certificate selection cancelled")
+            }
+            onResult(alias)
+        }
+    }
+
+    /**
+     * Returns the currently selected KeyChain alias, or null if none has
+     * been picked. Use to show the current selection in a settings UI.
+     */
+    fun getClientCertificateAlias(): String? = KeyChainCertProvider.storedAlias(context)
+
+    /**
+     * Forgets the selected KeyChain alias and rebuilds the shared HTTP
+     * client without a client certificate. Subsequent requests will use
+     * plain TLS unless an assets-based fallback is configured.
+     */
+    fun clearClientCertificate() {
+        KeyChainCertProvider.storeAlias(context, null)
+        MtlsConfigurator.reload(context)
+        logMessage("Cleared client certificate")
+    }
+
+    /**
+     * Redeems an invitation code via `{host}/api/v1/invitation-code/redeem`.
+     * Goes through the SDK's shared OkHttp client, so the configured client
+     * certificate (if any) is presented during the TLS handshake.
+     *
+     * @return a map with `statusCode` (Int), `body` (String), and `data`
+     *   (Map<String, Any?> — parsed JSON, empty if non-JSON or missing).
+     */
+    suspend fun redeemInvitationCode(host: String, code: String): Map<String, Any?> =
+        withContext(dispatchers.io) {
+            val normalizedHost = host.trimEnd('/')
+            val url = "$normalizedHost/api/v1/invitation-code/redeem"
+            val payload = JSONObject().put("code", code).toString()
+            val request = Request.Builder()
+                .url(url)
+                .post(payload.toRequestBody("application/json".toMediaType()))
+                .build()
+            SyncManager.sharedHttpClient.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                val parsed: Map<String, Any?> = if (responseBody.isNotEmpty()) {
+                    runCatching {
+                        val obj = JSONObject(responseBody)
+                        obj.keys().asSequence().associateWith { key ->
+                            val v = obj.get(key)
+                            if (v == JSONObject.NULL) null else v
+                        }
+                    }.getOrDefault(emptyMap())
+                } else {
+                    emptyMap()
+                }
+                mapOf(
+                    "statusCode" to response.code,
+                    "body" to responseBody,
+                    "data" to parsed,
+                )
+            }
+        }
 
     // -----------------------------------------------------------------------
     // Configuration
@@ -159,8 +273,14 @@ class OpenWearablesHealthSDK private constructor(
      * Set the background sync interval in minutes. Minimum is 15 (Android limit).
      */
     fun setSyncInterval(minutes: Long) {
-        ensureSyncManager().syncIntervalMinutes = minutes
-        logMessage("Sync interval set to ${maxOf(minutes, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)} minutes")
+        val sm = ensureSyncManager()
+        val clamped = maxOf(minutes, SyncDefaults.MIN_SYNC_INTERVAL_MINUTES)
+        sm.syncIntervalMinutes = clamped
+        val h = host
+        if (secureStorage.isSyncActive() && h != null) {
+            sm.reschedulePeriodicSync(h, customSyncUrl)
+        }
+        logMessage("Sync interval set to $clamped minutes")
     }
 
     /**
@@ -181,7 +301,14 @@ class OpenWearablesHealthSDK private constructor(
             logMessage("Cannot auto-restore: no session or host")
             return
         }
-        ensureSyncManager().startBackgroundSync(h, customSyncUrl)
+        val sm = ensureSyncManager()
+        sm.startBackgroundSync(h, customSyncUrl)
+        // Resume an interrupted export, including one that never landed its first
+        // payload (no progress to detect).
+        if (sm.hasResumableSyncSession() || !sm.hasCompletedInitialExport()) {
+            logMessage("Found interrupted sync, will resume...")
+            sm.syncNow(h, customSyncUrl, fullExport = false)
+        }
         logMessage("Background sync auto-restored")
     }
 
@@ -189,7 +316,18 @@ class OpenWearablesHealthSDK private constructor(
     // Authentication
     // -----------------------------------------------------------------------
 
+    /**
+     * Store credentials and reset anchors. Every sign-in starts a full export.
+     * Filling gaps from a backend sync status will replace this later.
+     */
     suspend fun signIn(userId: String, accessToken: String?, refreshToken: String?, apiKey: String?) {
+        val hasTokens = accessToken != null && refreshToken != null
+        val hasApiKey = apiKey != null
+        if (!hasTokens && !hasApiKey) {
+            logMessage("signIn error: Provide (accessToken + refreshToken) or (apiKey)")
+            return
+        }
+
         val sm = ensureSyncManager()
         sm.clearSyncSession()
         sm.resetAnchors()
@@ -203,8 +341,13 @@ class OpenWearablesHealthSDK private constructor(
         logMessage("Signed in: userId=$userId, mode=${if (accessToken != null) "token" else "apiKey"}")
     }
 
+    /**
+     * Sign out. Reports the disconnect to the backend first (#24), then clears
+     * local state. A failed DELETE does not keep the user signed in.
+     */
     suspend fun signOut() {
         logMessage("Signing out")
+        notifyBackendOfDisconnect()
         val sm = ensureSyncManager()
         sm.stopBackgroundSync()
         sm.resetAnchors()
@@ -214,6 +357,51 @@ class OpenWearablesHealthSDK private constructor(
         activeProvider = null
         syncManager = null
         logMessage("Sign out complete")
+    }
+
+    /**
+     * Best-effort `DELETE {apiBaseUrl}/users/{userId}/connections/{provider}`.
+     * Built while the credential is still in storage, 10s timeout, never throws.
+     */
+    private suspend fun notifyBackendOfDisconnect() {
+        val userId = secureStorage.getUserId()
+        val credential = secureStorage.authCredential
+        val base = secureStorage.apiBaseUrl
+        val provider = activeProvider?.providerId ?: secureStorage.getProvider()
+        if (userId.isNullOrEmpty() || credential.isNullOrEmpty() || base.isNullOrEmpty() || provider.isNullOrEmpty()) {
+            logMessage("Disconnect not sent - no session")
+            return
+        }
+        val url = SyncAuth.disconnectUrl(base, userId, provider)
+        withContext(dispatchers.io) {
+            try {
+                val client = SyncManager.sharedHttpClient.newBuilder()
+                    .callTimeout(10, TimeUnit.SECONDS)
+                    .connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(10, TimeUnit.SECONDS)
+                    .writeTimeout(10, TimeUnit.SECONDS)
+                    .build()
+                val requestBuilder = Request.Builder()
+                    .url(url)
+                    .delete()
+                    .header("X-Request-Id", UUID.randomUUID().toString())
+                if (secureStorage.isApiKeyAuth) {
+                    requestBuilder.header("X-Open-Wearables-API-Key", credential)
+                } else {
+                    val bearer = if (credential.startsWith("Bearer ")) credential else "Bearer $credential"
+                    requestBuilder.header("Authorization", bearer)
+                }
+                client.newCall(requestBuilder.build()).execute().use { response ->
+                    if (response.isSuccessful) {
+                        logMessage("Disconnect reported to backend")
+                    } else {
+                        logMessage("Disconnect rejected: HTTP ${response.code}")
+                    }
+                }
+            } catch (e: Exception) {
+                logMessage("Disconnect failed: ${e.message}")
+            }
+        }
     }
 
     fun restoreSession(): String? {
@@ -256,7 +444,12 @@ class OpenWearablesHealthSDK private constructor(
         val provider = getOrCreateProvider()
         provider.setTrackedTypes(types)
         logMessage("Requesting auth for ${types.size} types via ${provider.providerName}")
-        return provider.requestAuthorization(types)
+        val authorized = provider.requestAuthorization(types)
+        if (authorized && provider is HealthConnectManager && provider.consumeHistoryReadJustGranted()) {
+            logMessage("Health Connect history read granted — clearing anchors so the next sync re-exports older data")
+            resetAnchors()
+        }
+        return authorized
     }
 
     // -----------------------------------------------------------------------
@@ -280,7 +473,10 @@ class OpenWearablesHealthSDK private constructor(
 
         secureStorage.setSyncActive(true)
         logMessage("Background sync started (${getOrCreateProvider().providerName})")
-        ensureSyncManager().startBackgroundSync(h, customSyncUrl)
+        val sm = ensureSyncManager()
+        sm.startBackgroundSync(h, customSyncUrl)
+        // Do not wait for WorkManager (OEM delay / OnePlus).
+        sm.syncNow(h, customSyncUrl, fullExport = false)
     }
 
     suspend fun stopBackgroundSync() {
@@ -300,6 +496,11 @@ class OpenWearablesHealthSDK private constructor(
             logMessage("Triggering full export after reset...")
             scope.launch {
                 try {
+                    var waited = 0
+                    while (SyncManager.processSyncLock.get() && waited < 60_000) {
+                        delay(250)
+                        waited += 250
+                    }
                     sm.syncNow(h, customSyncUrl, fullExport = true)
                     logMessage("Full export after reset completed")
                 } catch (e: Exception) {
@@ -343,10 +544,16 @@ class OpenWearablesHealthSDK private constructor(
             return false
         }
 
+        val previousId = secureStorage.getProvider()
         activeProvider = provider
         secureStorage.saveProvider(providerId)
         rebuildSyncManager()
-        logMessage("Active provider set to: ${provider.providerName}")
+        if (previousId != null && previousId != providerId) {
+            logMessage("Provider changed to ${provider.providerName} — clearing anchors so the next sync exports this store")
+            resetAnchors()
+        } else {
+            logMessage("Active provider set to: ${provider.providerName}")
+        }
         return true
     }
 
@@ -371,11 +578,12 @@ class OpenWearablesHealthSDK private constructor(
         logMessage("App came to foreground")
 
         if (secureStorage.isSyncActive() && secureStorage.hasSession()) {
-            logMessage("Checking for pending sync...")
             scope.launch {
                 val sm = ensureSyncManager()
-                if (sm.hasResumableSyncSession()) {
-                    logMessage("Found interrupted sync, resuming...")
+                // Incomplete full export has no observer trigger; waiting for
+                // WorkManager on OEM skins drops it.
+                if (sm.hasResumableSyncSession() || !sm.hasCompletedInitialExport()) {
+                    logMessage("Resuming sync after foreground...")
                     host?.let { sm.syncNow(it, customSyncUrl, fullExport = false) }
                 }
             }
@@ -386,6 +594,10 @@ class OpenWearablesHealthSDK private constructor(
         logMessage("App went to background")
 
         if (secureStorage.isSyncActive() && secureStorage.hasSession()) {
+            if (SyncManager.processSyncLock.get()) {
+                logMessage("Sync already running — not enqueueing another worker")
+                return
+            }
             host?.let { h ->
                 logMessage("Scheduling background sync...")
                 ensureSyncManager().scheduleExpeditedSync(h, customSyncUrl)
@@ -394,6 +606,7 @@ class OpenWearablesHealthSDK private constructor(
     }
 
     fun destroy() {
+        unregisterLifecycleObserver()
         activeProvider?.disconnect()
         scope.cancel()
         synchronized(Companion) {
@@ -404,6 +617,25 @@ class OpenWearablesHealthSDK private constructor(
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
+
+    internal fun registerLifecycleObserver() {
+        if (lifecycleRegistered) return
+        try {
+            ProcessLifecycleOwner.get().lifecycle.addObserver(lifecycleObserver)
+            lifecycleRegistered = true
+        } catch (e: Exception) {
+            logMessage("Could not register process lifecycle observer: ${e.message}")
+        }
+    }
+
+    private fun unregisterLifecycleObserver() {
+        if (!lifecycleRegistered) return
+        try {
+            ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycleObserver)
+        } catch (_: Exception) {
+        }
+        lifecycleRegistered = false
+    }
 
     internal fun getOrCreateProvider(): HealthDataProvider {
         activeProvider?.let { return it }

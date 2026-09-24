@@ -7,6 +7,7 @@ import android.os.Build
 import com.samsung.android.sdk.health.data.HealthDataService
 import com.samsung.android.sdk.health.data.HealthDataStore
 import com.samsung.android.sdk.health.data.DeviceManager
+import com.samsung.android.sdk.health.data.data.ChangeType
 import com.samsung.android.sdk.health.data.data.HealthDataPoint
 import com.samsung.android.sdk.health.data.data.DataSource
 import com.samsung.android.sdk.health.data.device.Device
@@ -15,6 +16,7 @@ import com.samsung.android.sdk.health.data.permission.AccessType
 import com.samsung.android.sdk.health.data.permission.Permission
 import com.samsung.android.sdk.health.data.request.DataType
 import com.samsung.android.sdk.health.data.request.DataTypes
+import com.samsung.android.sdk.health.data.request.InstantTimeFilter
 import com.samsung.android.sdk.health.data.request.LocalTimeFilter
 import com.samsung.android.sdk.health.data.request.Ordering
 import com.samsung.android.sdk.health.data.request.AggregateRequest
@@ -39,12 +41,21 @@ class SamsungHealthManager(
     private var healthDataStore: HealthDataStore? = null
     private var deviceManager: DeviceManager? = null
     private var trackedTypeIds: Set<String> = emptySet()
-    private var deviceCache: MutableMap<String, Device> = mutableMapOf()
+    private var deviceCache: MutableMap<String, CachedSamsungDevice> = mutableMapOf()
     private var activityRef: WeakReference<Activity>? = activity?.let { WeakReference(it) }
+
+    /**
+     * Tolerance for future clock skew when validating provider timestamps (see #25).
+     * Public var so hosts can tighten/loosen it; applied in [readData] and [readDataDescending].
+     */
+    var futureSkewToleranceMs: Long = TimestampSanity.DEFAULT_FUTURE_SKEW_MS
 
     companion object {
         private const val SAMSUNG_HEALTH_PACKAGE = "com.sec.android.app.shealth"
         private const val MIN_SAMSUNG_HEALTH_VERSION = 6030002
+        private const val CHANGE_CURSOR_PREFIX = "sht:"
+        private const val CHANGE_PAGE_PREFIX = "shp:"
+        private const val CHANGE_PAGE_SIZE = 1000
     }
 
     // -----------------------------------------------------------------------
@@ -56,8 +67,34 @@ class SamsungHealthManager(
     }
 
     override fun setTrackedTypes(typeIds: List<String>) {
-        trackedTypeIds = typeIds.filter { isSupportedType(it) }.toSet()
+        rememberTrackedTypes(typeIds)
+    }
+
+    /**
+     * Several requested ids read one Samsung record and emit the same samples
+     * (the three blood-pressure ids, the body-composition ids). Keeping all of
+     * them re-reads and re-uploads that record on every page.
+     */
+    private fun rememberTrackedTypes(typeIds: List<String>) {
+        val collapsed = collapseSamsungTypeIds(typeIds)
+        val readable = typeIds.count { isSupportedType(it) }
+        trackedTypeIds = collapsed.toSet()
         logger("Tracking ${trackedTypeIds.size} Samsung Health types: ${trackedTypeIds.joinToString()}")
+        val dropped = readable - collapsed.size
+        if (dropped > 0) {
+            logger("Reading each Samsung Health record once ($dropped alias type(s) share a record with another requested type)")
+        }
+    }
+
+    private fun collapseSamsungTypeIds(typeIds: List<String>): List<String> {
+        val seen = HashSet<String>()
+        val kept = ArrayList<String>()
+        for (id in typeIds) {
+            if (!isSupportedType(id)) continue
+            val key = (mapToDataType(id) ?: getAggregateConfig(id)?.dataType)?.javaClass?.name ?: continue
+            if (seen.add(key)) kept.add(id)
+        }
+        return kept
     }
 
     private fun isSupportedType(typeId: String): Boolean =
@@ -125,8 +162,111 @@ class SamsungHealthManager(
         deviceManager = null
     }
 
+    override fun supportsChangeTracking(): Boolean = true
+
+    override fun canTrackChanges(typeId: String): Boolean =
+        mapToDataType(typeId) is DataType.ChangeReadable<*>
+
+    override suspend fun mintChangeToken(typeId: String): String? {
+        if (!canTrackChanges(typeId)) return null
+        return "$CHANGE_CURSOR_PREFIX${System.currentTimeMillis()}"
+    }
+
+    /**
+     * Changes are filtered by when Samsung wrote them, not by the sample's
+     * start time, so a backfill with an older date is still returned.
+     * The stored cursor is that write-time. A page in progress keeps the
+     * Samsung page token inside the same window.
+     */
+    override suspend fun readChanges(typeId: String, token: String): ChangeReadResult =
+        withContext(dispatchers.io) {
+            val readable = mapToDataType(typeId) as? DataType.ChangeReadable<*>
+                ?: return@withContext ChangeReadResult.unavailable()
+            val cursor = parseSamsungChangeCursor(token)
+                ?: return@withContext ChangeReadResult.expired()
+            if (healthDataStore == null) connect()
+            val store = healthDataStore ?: return@withContext ChangeReadResult.unavailable()
+
+            val startMs = cursor.startMs
+            val endMs = cursor.endMs ?: System.currentTimeMillis()
+            if (cursor.pageToken == null && startMs >= endMs) {
+                return@withContext ChangeReadResult(nextToken = "$CHANGE_CURSOR_PREFIX$endMs")
+            }
+
+            var pageToken = cursor.pageToken
+            var deleted = 0
+            val points = mutableListOf<HealthDataPoint>()
+            var hasMore = false
+            try {
+                var guard = 0
+                while (guard++ < 50) {
+                    val builder = readable.changedDataRequestBuilder
+                    builder.setChangeTimeFilter(
+                        InstantTimeFilter.of(Instant.ofEpochMilli(startMs), Instant.ofEpochMilli(endMs))
+                    )
+                    builder.setPageSize(CHANGE_PAGE_SIZE)
+                    if (pageToken != null) builder.setPageToken(pageToken)
+                    val response = store.readChanges(builder.build())
+                    for (change in response.dataList) {
+                        when (change.changeType) {
+                            ChangeType.DELETE -> deleted++
+                            ChangeType.UPSERT -> (change.upsertDataPoint as? HealthDataPoint)?.let { points.add(it) }
+                        }
+                    }
+                    val nextPage = response.pageToken
+                    if (points.isNotEmpty() || nextPage == null) {
+                        hasMore = nextPage != null
+                        pageToken = nextPage
+                        break
+                    }
+                    pageToken = nextPage
+                }
+                if (guard >= 50 && pageToken != null && points.isEmpty()) hasMore = true
+            } catch (e: Exception) {
+                logger("  $typeId: readChanges failed: ${e.javaClass.simpleName}: ${e.message}")
+                return@withContext ChangeReadResult.unavailable()
+            }
+
+            val nextToken = if (hasMore && pageToken != null) {
+                "$CHANGE_PAGE_PREFIX$startMs:$endMs:$pageToken"
+            } else {
+                "$CHANGE_CURSOR_PREFIX$endMs"
+            }
+            if (points.isEmpty()) {
+                return@withContext ChangeReadResult(
+                    nextToken = nextToken, hasMore = hasMore, deletedCount = deleted,
+                )
+            }
+            val raw = points.mapNotNull { parseDataPoint(typeId, it) }
+            val converted = convertToUnified(typeId, filterImplausibleTimestamps(typeId, raw))
+            ChangeReadResult(
+                data = converted.data,
+                nextToken = nextToken,
+                hasMore = hasMore,
+                upsertCount = points.size,
+                deletedCount = deleted,
+            )
+        }
+
+    private data class SamsungChangeCursor(val startMs: Long, val endMs: Long?, val pageToken: String?)
+
+    private fun parseSamsungChangeCursor(token: String): SamsungChangeCursor? {
+        if (token.startsWith(CHANGE_PAGE_PREFIX)) {
+            val parts = token.removePrefix(CHANGE_PAGE_PREFIX).split(":", limit = 3)
+            if (parts.size < 3) return null
+            val start = parts[0].toLongOrNull() ?: return null
+            val end = parts[1].toLongOrNull() ?: return null
+            return SamsungChangeCursor(start, end, parts[2])
+        }
+        if (token.startsWith(CHANGE_CURSOR_PREFIX)) {
+            val start = token.removePrefix(CHANGE_CURSOR_PREFIX).toLongOrNull() ?: return null
+            return SamsungChangeCursor(start, null, null)
+        }
+        return null
+    }
+
     override suspend fun requestAuthorization(typeIds: List<String>): Boolean {
-        trackedTypeIds = typeIds.filter { isSupportedType(it) }.toSet()
+        rememberTrackedTypes(typeIds)
         val dataTypes = typeIds.mapNotNull { mapToDataType(it) }.toSet()
         if (dataTypes.isEmpty()) {
             logger("No valid Samsung Health types to authorize")
@@ -165,7 +305,7 @@ class SamsungHealthManager(
     ): ProviderReadResult {
         val rawRecords = readRawData(typeId, sinceTimestamp, limit)
         if (rawRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
-        return convertToUnified(typeId, rawRecords)
+        return convertToUnified(typeId, filterImplausibleTimestamps(typeId, rawRecords))
     }
 
     override suspend fun readDataDescending(
@@ -175,7 +315,20 @@ class SamsungHealthManager(
     ): ProviderReadResult {
         val rawRecords = readRawDataDescending(typeId, olderThanTimestamp, limit)
         if (rawRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
-        return convertToUnified(typeId, rawRecords)
+        return convertToUnified(typeId, filterImplausibleTimestamps(typeId, rawRecords))
+    }
+
+    /**
+     * Drops records whose start/end timestamps are implausible (negative or beyond the
+     * future-skew tolerance) BEFORE they can reach payloads, min/max cursors or sync
+     * anchors. Logs a PII-free count so the corruption stays observable. See #25.
+     */
+    private fun filterImplausibleTimestamps(typeId: String, records: List<HealthDataRecord>): List<HealthDataRecord> {
+        val (plausible, rejected) = TimestampSanity.partition(records, futureSkewMs = futureSkewToleranceMs)
+        if (rejected.isNotEmpty()) {
+            logger("[$typeId] dropped ${rejected.size} record(s) with implausible timestamps (future beyond ${futureSkewToleranceMs}ms tolerance or negative)")
+        }
+        return plausible
     }
 
     // -----------------------------------------------------------------------
@@ -629,7 +782,7 @@ class SamsungHealthManager(
     private fun convertWorkout(raw: HealthDataRecord): List<UnifiedWorkout>? {
         val source = buildUnifiedSource(raw)
         val zoneOffset = raw.zoneOffset
-        val exerciseType = raw.fields["EXERCISE_TYPE"]?.toString() ?: "UNKNOWN"
+        val exerciseType = SamsungExerciseType.toPayloadType(raw.fields["EXERCISE_TYPE"])
 
         val sessions = raw.fields["SESSIONS"] as? List<Map<String, Any?>> ?: emptyList()
         if (sessions.isEmpty()) {
@@ -823,7 +976,11 @@ class SamsungHealthManager(
         deviceName = raw.device.name,
         deviceManufacturer = raw.device.manufacturer,
         deviceModel = raw.device.model,
-        deviceType = DeviceTypeMapper.fromSamsungDeviceType(raw.device.deviceType),
+        deviceType = DeviceTypeMapper.fromSamsungDeviceType(
+            raw.device.deviceType,
+            raw.device.name,
+            raw.device.model,
+        ),
         recordingMethod = null
     )
 
@@ -858,7 +1015,13 @@ class SamsungHealthManager(
         try {
             for (group in listOf(DeviceGroup.MOBILE, DeviceGroup.WATCH, DeviceGroup.RING, DeviceGroup.BAND, DeviceGroup.ACCESSORY)) {
                 try {
-                    dm.getDevices(group).forEach { device -> device.id?.let { deviceCache[it] = device } }
+                    dm.getDevices(group).forEach { device ->
+                        val id = device.id ?: return@forEach
+                        val existing = deviceCache[id]
+                        if (existing == null || samsungGroupRank(group) >= samsungGroupRank(existing.group)) {
+                            deviceCache[id] = CachedSamsungDevice(device, group)
+                        }
+                    }
                 } catch (_: Exception) {}
             }
             logger("Loaded ${deviceCache.size} devices from Samsung Health")
@@ -978,9 +1141,10 @@ class SamsungHealthManager(
 
     private fun getDeviceInfo(source: DataSource?): DeviceInfo {
         val deviceId = source?.deviceId
-        val cachedDevice = deviceId?.let { deviceCache[it] }
+        val cached = deviceId?.let { deviceCache[it] }
 
-        if (cachedDevice != null) {
+        if (cached != null) {
+            val cachedDevice = cached.device
             return DeviceInfo(
                 deviceId = deviceId,
                 manufacturer = cachedDevice.manufacturer ?: "Unknown",
@@ -991,7 +1155,7 @@ class SamsungHealthManager(
                 osType = "Android",
                 osVersion = "",
                 sdkVersion = 0,
-                deviceType = getDeviceGroup(cachedDevice),
+                deviceType = cached.group.name,
                 isSourceDevice = true
             )
         }
@@ -1011,18 +1175,12 @@ class SamsungHealthManager(
         )
     }
 
-    private fun getDeviceGroup(device: Device): String {
-        return try {
-            val groupMethod = device.javaClass.methods.find { it.name == "getGroup" || it.name == "getDeviceGroup" }
-            val group = groupMethod?.invoke(device)
-            when {
-                group is DeviceGroup -> group.name
-                group?.toString()?.contains("WATCH", ignoreCase = true) == true -> "WATCH"
-                group?.toString()?.contains("RING", ignoreCase = true) == true -> "RING"
-                group?.toString()?.contains("BAND", ignoreCase = true) == true -> "BAND"
-                else -> "MOBILE"
-            }
-        } catch (_: Exception) { "UNKNOWN" }
+    /** Prefer a wearable query group over MOBILE when the same id appears in both. */
+    private fun samsungGroupRank(group: DeviceGroup): Int = when (group) {
+        DeviceGroup.WATCH, DeviceGroup.RING, DeviceGroup.BAND -> 3
+        DeviceGroup.ACCESSORY -> 2
+        DeviceGroup.MOBILE -> 1
+        else -> 0
     }
 
     private fun getDataTypeName(typeId: String): String = when (typeId) {
@@ -1114,14 +1272,14 @@ class SamsungHealthManager(
 
     private fun extractBodyCompositionFields(dp: HealthDataPoint): Map<String, Any?> {
         val fields = mutableMapOf<String, Any?>()
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "WEIGHT", dp)?.let { fields["WEIGHT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "HEIGHT", dp)?.let { fields["HEIGHT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT", dp)?.let { fields["BODY_FAT"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BODY_FAT_MASS", dp)?.let { fields["BODY_FAT_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "FAT_FREE_MASS", dp)?.let { fields["FAT_FREE_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "SKELETAL_MUSCLE_MASS", dp)?.let { fields["SKELETAL_MUSCLE_MASS"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BMI", dp)?.let { fields["BMI"] = it }
-        getFieldValue<Float>(DataTypes.BODY_COMPOSITION, "BASAL_METABOLIC_RATE", dp)?.let { fields["BASAL_METABOLIC_RATE"] = it }
+        // Samsung returns these as Integer or Float. A Float-only read throws
+        // and parseDataPoint drops the whole record (#26).
+        listOf(
+            "WEIGHT", "HEIGHT", "BODY_FAT", "BODY_FAT_MASS",
+            "FAT_FREE_MASS", "SKELETAL_MUSCLE_MASS", "BMI", "BASAL_METABOLIC_RATE",
+        ).forEach { name ->
+            getNumberField(DataTypes.BODY_COMPOSITION, name, dp)?.let { fields[name] = it }
+        }
         return fields
     }
 
@@ -1134,7 +1292,9 @@ class SamsungHealthManager(
     @Suppress("UNCHECKED_CAST")
     private fun extractExerciseFields(dp: HealthDataPoint): Map<String, Any?> {
         val fields = mutableMapOf<String, Any?>()
-        getFieldValue<Any>(DataTypes.EXERCISE, "EXERCISE_TYPE", dp)?.let { fields["EXERCISE_TYPE"] = if (it is Enum<*>) it.name else it.toString() }
+        getFieldValue<Any>(DataTypes.EXERCISE, "EXERCISE_TYPE", dp)?.let {
+            fields["EXERCISE_TYPE"] = SamsungExerciseType.toPayloadType(it)
+        }
         getFieldValue<Float>(DataTypes.EXERCISE, "TOTAL_CALORIES", dp)?.let { fields["TOTAL_CALORIES"] = it }
         getFieldValue<Long>(DataTypes.EXERCISE, "TOTAL_DURATION", dp)?.let { fields["TOTAL_DURATION"] = it }
         getFieldValue<String>(DataTypes.EXERCISE, "CUSTOM_TITLE", dp)?.let { fields["CUSTOM_TITLE"] = it }
@@ -1220,4 +1380,13 @@ class SamsungHealthManager(
             getValueMethod.invoke(dataPoint, field) as? T
         } catch (_: Exception) { null }
     }
+
+    /** Integer, Float, Double, and Long are all valid Samsung numeric fields. */
+    private fun getNumberField(dataType: DataType, fieldName: String, dataPoint: HealthDataPoint): Number? =
+        getFieldValue<Any>(dataType, fieldName, dataPoint) as? Number
 }
+
+private data class CachedSamsungDevice(
+    val device: Device,
+    val group: DeviceGroup,
+)

@@ -9,6 +9,9 @@ import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.metadata.Metadata
+import androidx.health.connect.client.changes.DeletionChange
+import androidx.health.connect.client.changes.UpsertionChange
+import androidx.health.connect.client.request.ChangesTokenRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.CompletableDeferred
@@ -32,9 +35,25 @@ class HealthConnectManager(
     private var client: HealthConnectClient? = null
     private var trackedTypeIds: Set<String> = emptySet()
     private var permissionLauncher: ActivityResultLauncher<Set<String>>? = null
+
+    /** Set when this authorize call is the one that first obtains history read. */
+    private var historyReadJustGranted = false
     private var pendingPermissionResult: CompletableDeferred<Set<String>>? = null
     private var launcherRegistered = false
     private var activityRef: WeakReference<Activity>? = activity?.let { WeakReference(it) }
+
+    /** Metrics that returned SecurityException. Cleared on [connect]. */
+    private val deniedWorkoutMetrics = mutableSetOf<String>()
+
+    /** Skip workout side-queries until this time after a Health Connect rate limit. */
+    @Volatile
+    private var workoutMetricsPausedUntilMs: Long = 0L
+
+    /**
+     * Tolerance for future clock skew when validating provider timestamps (see #25).
+     * Public var so hosts can tighten/loosen it; applied in [readRecordType], [readWorkouts] and [readSleep].
+     */
+    var futureSkewToleranceMs: Long = TimestampSanity.DEFAULT_FUTURE_SKEW_MS
 
     // -----------------------------------------------------------------------
     // HealthDataProvider interface
@@ -79,9 +98,34 @@ class HealthConnectManager(
     }
 
     override fun setTrackedTypes(typeIds: List<String>) {
-        trackedTypeIds = typeIds.toSet()
-        val validCount = typeIds.count { mapToRecordClass(it) != null }
-        logger("Tracking $validCount Health Connect types (out of ${typeIds.size} requested)")
+        rememberTrackedTypes(typeIds)
+    }
+
+    /**
+     * Several requested ids read one Health Connect record and emit the same
+     * samples (`distanceWalkingRunning` / `distanceCycling`, the three blood
+     * pressure ids, speed / power / hydration aliases). Keeping all of them
+     * re-reads and re-uploads that record on every page.
+     */
+    private fun rememberTrackedTypes(typeIds: List<String>) {
+        val collapsed = collapseHealthConnectTypeIds(typeIds)
+        val readable = typeIds.count { mapToRecordClass(it) != null }
+        trackedTypeIds = collapsed.toSet()
+        logger("Tracking ${trackedTypeIds.size} Health Connect types (out of ${typeIds.size} requested)")
+        val dropped = readable - collapsed.size
+        if (dropped > 0) {
+            logger("Reading each Health Connect record once ($dropped alias type(s) share a record with another requested type)")
+        }
+    }
+
+    private fun collapseHealthConnectTypeIds(typeIds: List<String>): List<String> {
+        val seen = HashSet<String>()
+        val kept = ArrayList<String>()
+        for (id in typeIds) {
+            val key = mapToRecordClass(id)?.qualifiedName ?: continue
+            if (seen.add(key)) kept.add(id)
+        }
+        return kept
     }
 
     override fun getTrackedTypes(): Set<String> = trackedTypeIds
@@ -102,6 +146,7 @@ class HealthConnectManager(
         }
         return try {
             client = HealthConnectClient.getOrCreate(context)
+            deniedWorkoutMetrics.clear()
             logger("Connected to Health Connect")
             true
         } catch (e: Exception) {
@@ -115,7 +160,7 @@ class HealthConnectManager(
     }
 
     override suspend fun requestAuthorization(typeIds: List<String>): Boolean {
-        trackedTypeIds = typeIds.filter { mapToRecordClass(it) != null }.toSet()
+        rememberTrackedTypes(typeIds)
 
         val permissions = typeIds.mapNotNull { typeId ->
             mapToRecordClass(typeId)?.let { HealthPermission.getReadPermission(it) }
@@ -127,6 +172,7 @@ class HealthConnectManager(
         }
 
         permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
+        permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY)
 
         if (client == null && !connect()) return false
         val hcClient = client ?: return false
@@ -134,7 +180,8 @@ class HealthConnectManager(
         val alreadyGranted = hcClient.permissionController.getGrantedPermissions()
         val needed = permissions - alreadyGranted
         if (needed.isEmpty()) {
-            logger("All ${permissions.size} Health Connect permissions already granted (including background read)")
+            historyReadJustGranted = false
+            logger("All ${permissions.size} Health Connect permissions already granted (including background read and history)")
             return true
         }
 
@@ -148,22 +195,45 @@ class HealthConnectManager(
             val deferred = CompletableDeferred<Set<String>>()
             pendingPermissionResult = deferred
 
-            logger("Launching Health Connect permission dialog for ${needed.size} permissions (includes background read)")
+            logger("Launching Health Connect permission dialog for ${needed.size} permissions (includes background read and history)")
             launcher.launch(needed)
 
             val granted = deferred.await()
             pendingPermissionResult = null
 
             val totalGranted = alreadyGranted + granted
+            val optional = setOf(
+                HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND,
+                HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY,
+            )
             val bgGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in totalGranted
-            val dataPermsGranted = (permissions - HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND).all { it in totalGranted }
-            logger("Data permissions: ${if (dataPermsGranted) "all granted" else "some missing"}, background read: ${if (bgGranted) "granted" else "NOT granted"}")
+            val historyGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY in totalGranted
+            val historyBefore = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY in alreadyGranted
+            historyReadJustGranted = historyGranted && !historyBefore
+            val dataPermsGranted = (permissions - optional).all { it in totalGranted }
+            logger(
+                "Data permissions: ${if (dataPermsGranted) "all granted" else "some missing"}, " +
+                    "background read: ${if (bgGranted) "granted" else "NOT granted"}, " +
+                    "history read: ${if (historyGranted) "granted" else "NOT granted — only the last 30 days are readable"}"
+            )
             dataPermsGranted
         } catch (e: Exception) {
             logger("Health Connect permission request failed: ${e.message}")
             pendingPermissionResult = null
+            historyReadJustGranted = false
             false
         }
+    }
+
+    /**
+     * True once, after [requestAuthorization] is the call that first received
+     * history read. The finished export minted change tokens at "now", so
+     * incremental sync would never walk back into the newly visible window.
+     */
+    fun consumeHistoryReadJustGranted(): Boolean {
+        val granted = historyReadJustGranted
+        historyReadJustGranted = false
+        return granted
     }
 
     // -----------------------------------------------------------------------
@@ -234,7 +304,7 @@ class HealthConnectManager(
                 "power", "cyclingPower", "runningPower" -> readRecordType<PowerRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertPower(it) }
                 "speed", "cyclingSpeed", "runningSpeed" -> readRecordType<SpeedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSpeed(it) }
                 "totalCaloriesBurned", "totalEnergy" -> readRecordType<TotalCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertTotalCalories(it) }
-                "cyclingPedalingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
+                "cyclingPedalingCadence", "cyclingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
                 "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
@@ -243,8 +313,148 @@ class HealthConnectManager(
             logger("  $typeId: missing permission, skipping")
             ProviderReadResult(UnifiedHealthData(), null, null)
         } catch (e: Exception) {
+            if (isHealthConnectQuotaExceeded(e)) {
+                logger("  $typeId: Health Connect rate limit — pausing reads")
+                return@withContext ProviderReadResult(
+                    UnifiedHealthData(), null, null, quotaExceeded = true,
+                )
+            }
             logger("Failed to read $typeId from Health Connect: ${e.javaClass.simpleName}: ${e.message}")
             ProviderReadResult(UnifiedHealthData(), null, null)
+        }
+    }
+
+    override fun supportsChangeTracking(): Boolean = true
+
+    override fun supportsParallelReads(): Boolean = true
+
+    override fun canTrackChanges(typeId: String): Boolean = mapToRecordClass(typeId) != null
+
+    override suspend fun mintChangeToken(typeId: String): String? = withContext(dispatchers.io) {
+        if (client == null) withContext(dispatchers.main) { connect() }
+        val hcClient = client ?: return@withContext null
+        val recordClass = mapToRecordClass(typeId) ?: return@withContext null
+        try {
+            hcClient.getChangesToken(ChangesTokenRequest(setOf(recordClass)))
+        } catch (e: Exception) {
+            if (isHealthConnectQuotaExceeded(e)) {
+                SyncManager.quotaBackoffPending.set(true)
+            }
+            logger("  $typeId: mintChangeToken failed: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+    }
+
+    override suspend fun readChanges(typeId: String, token: String): ChangeReadResult =
+        withContext(dispatchers.io) {
+            if (client == null) withContext(dispatchers.main) { connect() }
+            val hcClient = client ?: return@withContext ChangeReadResult.unavailable()
+            try {
+                var current = token
+                var upserts = mutableListOf<Record>()
+                var deleted = 0
+                var hasMore: Boolean
+                do {
+                    val response = hcClient.getChanges(current)
+                    for (change in response.changes) {
+                        when (change) {
+                            is UpsertionChange -> upserts.add(change.record)
+                            is DeletionChange -> deleted++
+                        }
+                    }
+                    current = response.nextChangesToken
+                    hasMore = response.hasMore
+                } while (hasMore && upserts.isEmpty())
+
+                if (upserts.isEmpty()) {
+                    return@withContext ChangeReadResult(
+                        nextToken = current,
+                        hasMore = hasMore,
+                        deletedCount = deleted,
+                    )
+                }
+
+                val converted = convertChangeRecords(hcClient, typeId, upserts)
+                ChangeReadResult(
+                    data = converted.data,
+                    nextToken = current,
+                    hasMore = hasMore,
+                    upsertCount = upserts.size,
+                    deletedCount = deleted,
+                )
+            } catch (e: SecurityException) {
+                logger("  $typeId: missing permission, skipping changes")
+                ChangeReadResult.unavailable()
+            } catch (e: Exception) {
+                if (isChangesTokenExpired(e)) {
+                    logger("  $typeId: change token expired")
+                    return@withContext ChangeReadResult.expired()
+                }
+                logger("  $typeId: readChanges failed: ${e.javaClass.simpleName}: ${e.message}")
+                ChangeReadResult.unavailable()
+            }
+        }
+
+    private fun isChangesTokenExpired(error: Throwable): Boolean {
+        var e: Throwable? = error
+        while (e != null) {
+            val name = e.javaClass.simpleName
+            val message = e.message.orEmpty()
+            if (name.contains("ChangesTokenExpired", ignoreCase = true)) return true
+            if (message.contains("token", ignoreCase = true) && message.contains("expir", ignoreCase = true)) return true
+            e = e.cause
+        }
+        return false
+    }
+
+    private suspend fun convertChangeRecords(
+        client: HealthConnectClient,
+        typeId: String,
+        records: List<Record>,
+    ): ProviderReadResult {
+        return when (typeId) {
+            "steps" -> convertFiltered(typeId, records.filterIsInstance<StepsRecord>()) { convertSteps(it) }
+            "heartRate" -> convertFiltered(typeId, records.filterIsInstance<HeartRateRecord>()) { convertHeartRate(it) }
+            "restingHeartRate" -> convertFiltered(typeId, records.filterIsInstance<RestingHeartRateRecord>()) { convertRestingHeartRate(it) }
+            "heartRateVariabilitySDNN" -> convertFiltered(typeId, records.filterIsInstance<HeartRateVariabilityRmssdRecord>()) { convertHrv(it) }
+            "oxygenSaturation" -> convertFiltered(typeId, records.filterIsInstance<OxygenSaturationRecord>()) { convertOxygenSaturation(it) }
+            "bloodPressure", "bloodPressureSystolic", "bloodPressureDiastolic" ->
+                convertFiltered(typeId, records.filterIsInstance<BloodPressureRecord>()) { convertBloodPressure(it) }
+            "bloodGlucose" -> convertFiltered(typeId, records.filterIsInstance<BloodGlucoseRecord>()) { convertBloodGlucose(it) }
+            "activeEnergy" -> convertFiltered(typeId, records.filterIsInstance<ActiveCaloriesBurnedRecord>()) { convertActiveCalories(it) }
+            "basalEnergy" -> convertFiltered(typeId, records.filterIsInstance<BasalMetabolicRateRecord>()) { convertBasalCalories(it) }
+            "bodyTemperature" -> convertFiltered(typeId, records.filterIsInstance<BodyTemperatureRecord>()) { convertBodyTemperature(it) }
+            "bodyMass" -> convertFiltered(typeId, records.filterIsInstance<WeightRecord>()) { convertWeight(it) }
+            "height" -> convertFiltered(typeId, records.filterIsInstance<HeightRecord>()) { convertHeight(it) }
+            "bodyFatPercentage" -> convertFiltered(typeId, records.filterIsInstance<BodyFatRecord>()) { convertBodyFat(it) }
+            "leanBodyMass" -> convertFiltered(typeId, records.filterIsInstance<LeanBodyMassRecord>()) { convertLeanBodyMass(it) }
+            "flightsClimbed" -> convertFiltered(typeId, records.filterIsInstance<FloorsClimbedRecord>()) { convertFloors(it) }
+            "distanceWalkingRunning", "distanceCycling" ->
+                convertFiltered(typeId, records.filterIsInstance<DistanceRecord>()) { convertDistance(it) }
+            "water", "dietaryWater" -> convertFiltered(typeId, records.filterIsInstance<HydrationRecord>()) { convertHydration(it) }
+            "vo2Max" -> convertFiltered(typeId, records.filterIsInstance<Vo2MaxRecord>()) { convertVo2Max(it) }
+            "respiratoryRate" -> convertFiltered(typeId, records.filterIsInstance<RespiratoryRateRecord>()) { convertRespiratoryRate(it) }
+            "power", "cyclingPower", "runningPower" ->
+                convertFiltered(typeId, records.filterIsInstance<PowerRecord>()) { convertPower(it) }
+            "speed", "cyclingSpeed", "runningSpeed" ->
+                convertFiltered(typeId, records.filterIsInstance<SpeedRecord>()) { convertSpeed(it) }
+            "totalCaloriesBurned", "totalEnergy" ->
+                convertFiltered(typeId, records.filterIsInstance<TotalCaloriesBurnedRecord>()) { convertTotalCalories(it) }
+            "cyclingPedalingCadence", "cyclingCadence" ->
+                convertFiltered(typeId, records.filterIsInstance<CyclingPedalingCadenceRecord>()) { convertCyclingCadence(it) }
+            "workout" -> {
+                val sessions = records.filterIsInstance<ExerciseSessionRecord>()
+                val (plausible, _) = filterRecordsWithImplausibleTimestamps("workout", sessions)
+                if (plausible.isEmpty()) ProviderReadResult(UnifiedHealthData(), null, null)
+                else convertWorkoutRecords(client, plausible, ascending = true)
+            }
+            "sleep" -> {
+                val sessions = records.filterIsInstance<SleepSessionRecord>()
+                val (plausible, _) = filterRecordsWithImplausibleTimestamps("sleep", sessions)
+                if (plausible.isEmpty()) ProviderReadResult(UnifiedHealthData(), null, null)
+                else convertSleepRecords(plausible, ascending = true)
+            }
+            else -> ProviderReadResult(UnifiedHealthData(), null, null)
         }
     }
 
@@ -280,16 +490,19 @@ class HealthConnectManager(
         val response = client.readRecords(request)
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        logger("Read ${response.records.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
-        val result = convert(response.records)
+        val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps(typeId, response.records)
+        if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
+        logger("Read ${plausibleRecords.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
+        val result = convert(plausibleRecords)
+
+        val minTs = if (!ascending && plausibleRecords.isNotEmpty()) {
             // Use startTime (minus 1ms) rather than endTime so the next
             // descending page's `before(cursor)` strictly excludes this
             // record. HC's before() filter tests against startTime, so a
             // SeriesRecord like PowerRecord with [start, end] gets re-included
             // when cursor = end and start < end.
-            getRecordStartMillis(response.records.last())?.minus(1)
+            getRecordStartMillis(plausibleRecords.last())?.minus(1)
         } else null
 
         return ProviderReadResult(result.data, result.maxTimestamp, minTs)
@@ -353,6 +566,32 @@ class HealthConnectManager(
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
+    }
+
+    private fun <T : Record> convertFiltered(
+        typeId: String,
+        records: List<T>,
+        convert: (List<T>) -> ProviderReadResult,
+    ): ProviderReadResult {
+        val (plausible, _) = filterRecordsWithImplausibleTimestamps(typeId, records)
+        if (plausible.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+        return convert(plausible)
+    }
+
+    private fun <T : Record> filterRecordsWithImplausibleTimestamps(
+        typeId: String,
+        records: List<T>
+    ): Pair<List<T>, Int> {
+        val now = System.currentTimeMillis()
+        val plausible = records.filter { r ->
+            val ts = getRecordTimestamp(r)
+            ts == null || !TimestampSanity.isImplausible(ts, now, futureSkewToleranceMs)
+        }
+        val rejected = records.size - plausible.size
+        if (rejected > 0) {
+            logger("[$typeId] dropped $rejected record(s) with implausible timestamps (future beyond ${futureSkewToleranceMs}ms tolerance or negative)")
+        }
+        return plausible to rejected
     }
 
     // -----------------------------------------------------------------------
@@ -749,8 +988,20 @@ class HealthConnectManager(
         )
         if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
+        val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps("workout", response.records)
+        if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+
+        return convertWorkoutRecords(client, plausibleRecords, ascending)
+    }
+
+    private suspend fun convertWorkoutRecords(
+        client: HealthConnectClient,
+        plausibleRecords: List<ExerciseSessionRecord>,
+        ascending: Boolean,
+    ): ProviderReadResult {
         var maxTs: Long? = null
-        val workouts = response.records.map { r ->
+        val sideQueryBudget = intArrayOf(WORKOUT_SIDE_QUERIES_PER_PAGE)
+        val workouts = plausibleRecords.map { r ->
             val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
             val source = buildSource(r.metadata)
             val zo = zoneStr(r.startZoneOffset)
@@ -768,7 +1019,7 @@ class HealthConnectManager(
             // duration, so ``workout_details`` rows landed completely
             // empty for every HC-sourced workout. See Bug 1 in the
             // Peloton upstream issue for details.
-            attachLinkedWorkoutMetrics(client, r, values)
+            attachLinkedWorkoutMetrics(client, r, values, sideQueryBudget)
 
             val segments = r.segments.map { seg ->
                 mapOf<String, Any?>(
@@ -822,8 +1073,8 @@ class HealthConnectManager(
             )
         }
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
-            response.records.last().endTime.toEpochMilli()
+        val minTs = if (!ascending && plausibleRecords.isNotEmpty()) {
+            plausibleRecords.last().endTime.toEpochMilli()
         } else null
 
         return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs)
@@ -838,31 +1089,60 @@ class HealthConnectManager(
      * ``_extract_metrics_from_workout_stats`` pipeline picks them up
      * without any backend change.
      *
-     * Every side-query is wrapped in its own try/catch so a missing
-     * permission or empty result for one type never aborts the others.
-     * Errors are logged at debug level (the SDK's general logger) so
-     * users can diagnose permission problems without the whole workout
-     * ingest breaking.
+     * Every side-query is wrapped so a missing permission or empty result
+     * for one type never aborts the workout itself. A missing permission
+     * is remembered for the rest of this connection. A rate-limit pauses
+     * every remaining side-query so the quota is left for the actual
+     * record reads and uploads.
      */
     private suspend fun attachLinkedWorkoutMetrics(
         client: HealthConnectClient,
         session: ExerciseSessionRecord,
         values: MutableList<Map<String, Any>>,
+        sideQueryBudget: IntArray,
     ) {
+        if (System.currentTimeMillis() < workoutMetricsPausedUntilMs) return
+        if (sideQueryBudget[0] <= 0) return
+
         val window = TimeRangeFilter.between(session.startTime, session.endTime)
         val sessionPackage = session.metadata.dataOrigin.packageName
         fun sameWriter(meta: Metadata): Boolean =
             sessionPackage.isNotEmpty() && meta.dataOrigin.packageName == sessionPackage
 
-        // Heart rate (per-sample, min/avg/max)
-        try {
-            val hr = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = HeartRateRecord::class,
-                    timeRangeFilter = window,
+        suspend fun <T : Record> readMetric(
+            key: String,
+            recordType: KClass<T>,
+            label: String,
+            consume: (List<T>) -> Unit,
+        ) {
+            if (key in deniedWorkoutMetrics) return
+            if (System.currentTimeMillis() < workoutMetricsPausedUntilMs) return
+            if (sideQueryBudget[0] <= 0) return
+            sideQueryBudget[0]--
+            try {
+                val response = client.readRecords(
+                    ReadRecordsRequest(recordType = recordType, timeRangeFilter = window)
                 )
-            )
-            val samples = hr.records
+                consume(response.records)
+            } catch (e: Exception) {
+                when {
+                    e is SecurityException -> {
+                        if (deniedWorkoutMetrics.add(key)) {
+                            logger("readWorkouts: skipping $label aggregates (missing permission): ${e.message}")
+                        }
+                    }
+                    isHealthConnectQuotaExceeded(e) -> {
+                        workoutMetricsPausedUntilMs =
+                            System.currentTimeMillis() + WORKOUT_METRICS_COOLDOWN_MS
+                        logger("readWorkouts: pausing session aggregates for 15 min — Health Connect rate limit")
+                    }
+                    else -> logger("readWorkouts: skipping $label aggregates: ${e.javaClass.simpleName}: ${e.message}")
+                }
+            }
+        }
+
+        readMetric("heartRate", HeartRateRecord::class, "HeartRate") { records ->
+            val samples = records
                 .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
                 .flatMap { it.samples }
             if (samples.isNotEmpty()) {
@@ -873,40 +1153,22 @@ class HealthConnectManager(
                 values += mapOf("type" to "averageHeartRate", "value" to avgBpm, "unit" to "bpm")
                 values += mapOf("type" to "maxHeartRate", "value" to maxBpm, "unit" to "bpm")
             }
-        } catch (e: Exception) {
-            logger("readWorkouts: skipping HeartRate aggregates: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // Power (PowerRecord — per-sample; emit averageRunningPower because
-        // the backend keys on this name to populate average_watts for any
-        // workout type, not just running).
-        try {
-            val pr = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = PowerRecord::class,
-                    timeRangeFilter = window,
-                )
-            )
-            val samples = pr.records
+        // averageRunningPower: the backend keys on this name to populate
+        // average_watts for any workout type, not just running.
+        readMetric("power", PowerRecord::class, "Power") { records ->
+            val samples = records
                 .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
                 .flatMap { it.samples }
             if (samples.isNotEmpty()) {
                 val avgW = samples.sumOf { it.power.inWatts } / samples.size
                 values += mapOf("type" to "averageRunningPower", "value" to avgW, "unit" to "W")
             }
-        } catch (e: Exception) {
-            logger("readWorkouts: skipping Power aggregates: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // Speed (SpeedRecord — per-sample; averageSpeed + maxSpeed)
-        try {
-            val sr = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = SpeedRecord::class,
-                    timeRangeFilter = window,
-                )
-            )
-            val samples = sr.records
+        readMetric("speed", SpeedRecord::class, "Speed") { records ->
+            val samples = records
                 .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
                 .flatMap { it.samples }
             if (samples.isNotEmpty()) {
@@ -915,64 +1177,49 @@ class HealthConnectManager(
                 values += mapOf("type" to "averageSpeed", "value" to avg, "unit" to "m/s")
                 values += mapOf("type" to "maxSpeed", "value" to max, "unit" to "m/s")
             }
-        } catch (e: Exception) {
-            logger("readWorkouts: skipping Speed aggregates: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // Distance (DistanceRecord — sum across the window)
-        try {
-            val dr = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = DistanceRecord::class,
-                    timeRangeFilter = window,
-                )
-            )
-            val totalM = dr.records
+        readMetric("distance", DistanceRecord::class, "Distance") { records ->
+            val totalM = records
                 .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
                 .sumOf { it.distance.inMeters }
             if (totalM > 0) {
                 values += mapOf("type" to "distance", "value" to totalM, "unit" to "m")
             }
-        } catch (e: Exception) {
-            logger("readWorkouts: skipping Distance aggregates: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // Total calories burned (TotalCaloriesBurnedRecord — sum across the window)
-        try {
-            val cr = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = TotalCaloriesBurnedRecord::class,
-                    timeRangeFilter = window,
-                )
-            )
-            val totalKcal = cr.records
+        readMetric("totalCalories", TotalCaloriesBurnedRecord::class, "TotalCalories") { records ->
+            val totalKcal = records
                 .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
                 .sumOf { it.energy.inKilocalories }
             if (totalKcal > 0) {
                 values += mapOf("type" to "totalCalories", "value" to totalKcal, "unit" to "kcal")
             }
-        } catch (e: Exception) {
-            logger("readWorkouts: skipping TotalCalories aggregates: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // Cadence (CyclingPedalingCadenceRecord — mean RPM)
-        try {
-            val cc = client.readRecords(
-                ReadRecordsRequest(
-                    recordType = CyclingPedalingCadenceRecord::class,
-                    timeRangeFilter = window,
-                )
-            )
-            val samples = cc.records
+        readMetric("cadence", CyclingPedalingCadenceRecord::class, "Cadence") { records ->
+            val samples = records
                 .filter { sessionPackage.isEmpty() || sameWriter(it.metadata) }
                 .flatMap { it.samples }
             if (samples.isNotEmpty()) {
                 val avgRpm = samples.sumOf { it.revolutionsPerMinute } / samples.size
                 values += mapOf("type" to "meanCadence", "value" to avgRpm, "unit" to "rpm")
             }
-        } catch (e: Exception) {
-            logger("readWorkouts: skipping Cadence aggregates: ${e.javaClass.simpleName}: ${e.message}")
         }
+    }
+
+    private fun isHealthConnectQuotaExceeded(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            val message = current.message.orEmpty()
+            if (message.contains("Rate limited", ignoreCase = true) ||
+                message.contains("quota", ignoreCase = true)
+            ) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -1083,12 +1330,22 @@ class HealthConnectManager(
                 pageSize = limit
             )
         )
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
 
+        val (plausibleRecords, rejectedCount) = filterRecordsWithImplausibleTimestamps("sleep", response.records)
+        if (plausibleRecords.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+
+        return convertSleepRecords(plausibleRecords, ascending)
+    }
+
+    private fun convertSleepRecords(
+        plausibleRecords: List<SleepSessionRecord>,
+        ascending: Boolean,
+    ): ProviderReadResult {
         var maxTs: Long? = null
         val sleepEntries = mutableListOf<UnifiedSleep>()
 
-        for (r in response.records) {
+        for (r in plausibleRecords) {
             try {
                 val end = r.endTime.toEpochMilli(); if (maxTs == null || end > maxTs!!) maxTs = end
                 val source = buildSource(r.metadata)
@@ -1126,8 +1383,8 @@ class HealthConnectManager(
             }
         }
 
-        val minTs = if (!ascending && response.records.isNotEmpty()) {
-            response.records.last().endTime.toEpochMilli()
+        val minTs = if (!ascending && plausibleRecords.isNotEmpty()) {
+            plausibleRecords.last().endTime.toEpochMilli()
         } else null
 
         return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs)
@@ -1175,9 +1432,17 @@ class HealthConnectManager(
         "power", "cyclingPower", "runningPower" -> PowerRecord::class
         "speed", "cyclingSpeed", "runningSpeed" -> SpeedRecord::class
         "totalCaloriesBurned", "totalEnergy" -> TotalCaloriesBurnedRecord::class
-        "cyclingPedalingCadence" -> CyclingPedalingCadenceRecord::class
+        "cyclingPedalingCadence", "cyclingCadence" -> CyclingPedalingCadenceRecord::class
         "workout" -> ExerciseSessionRecord::class
         "sleep" -> SleepSessionRecord::class
         else -> null
+    }
+
+    private companion object {
+        /** Matches the periodic sync interval so the next run can retry aggregates. */
+        private const val WORKOUT_METRICS_COOLDOWN_MS = 15L * 60L * 1000L
+
+        /** Caps per-session side-queries so one workout page cannot exhaust the quota. */
+        private const val WORKOUT_SIDE_QUERIES_PER_PAGE = 24
     }
 }
