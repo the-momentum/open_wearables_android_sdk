@@ -933,7 +933,8 @@ class SyncManager(
         writer.name("source")
         writeSource(writer, record.source)
         writer.name("value").value(record.value)
-        writer.name("unit").value(record.unit)
+        writer.name("unit")
+        writeNullableString(writer, record.unit)
         writer.name("parentId")
         writeNullableString(writer, record.parentId)
         writer.name("metadata")
@@ -1202,6 +1203,7 @@ class SyncManager(
         "flightsClimbed" -> "FLOORS_CLIMBED"
         "distanceWalkingRunning", "distanceCycling" -> "DISTANCE"
         "water", "dietaryWater" -> "HYDRATION"
+        in NutritionPayload.trackedTypeIds -> "NUTRITION"
         "vo2Max" -> "VO2_MAX"
         "respiratoryRate" -> "RESPIRATORY_RATE"
         "workout" -> "WORKOUT"

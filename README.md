@@ -25,7 +25,7 @@ Native Android SDK for reading and syncing health data from **Samsung Health** a
 | **Respiratory** | respiratoryRate |
 | **Body** | bodyMass, height, bodyFatPercentage, leanBodyMass, bodyTemperature |
 | **Blood** | bloodGlucose, bloodPressure (systolic + diastolic) |
-| **Nutrition** | water |
+| **Nutrition** | food meal plus dietary nutrients (Health Connect and Samsung); water |
 | **Sleep** | sleep (with stages) |
 | **Workouts** | workout (with segments, laps, route, samples) |
 

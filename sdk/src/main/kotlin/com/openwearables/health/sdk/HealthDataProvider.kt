@@ -42,7 +42,8 @@ interface HealthDataProvider {
 
     /**
      * Show the provider's native permission UI for the given [typeIds].
-     * Returns `true` if all requested permissions were granted.
+     * Returns `true` when at least one requested data type was granted.
+     * Types the user denied are removed from the tracked set and are not synced.
      */
     suspend fun requestAuthorization(typeIds: List<String>): Boolean
 

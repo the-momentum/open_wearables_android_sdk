@@ -440,16 +440,22 @@ class OpenWearablesHealthSDK private constructor(
     // -----------------------------------------------------------------------
 
     suspend fun requestAuthorization(types: List<String>): Boolean {
-        secureStorage.saveTrackedTypes(types)
         val provider = getOrCreateProvider()
         provider.setTrackedTypes(types)
         logMessage("Requesting auth for ${types.size} types via ${provider.providerName}")
         val authorized = provider.requestAuthorization(types)
-        if (authorized && provider is HealthConnectManager && provider.consumeHistoryReadJustGranted()) {
+        if (!authorized) {
+            logMessage("Authorization denied — no health data types granted")
+            return false
+        }
+        val grantedTypes = provider.getTrackedTypes().sorted()
+        secureStorage.saveTrackedTypes(grantedTypes)
+        logMessage("Authorized ${grantedTypes.size} type(s); denied types are not synced")
+        if (provider is HealthConnectManager && provider.consumeHistoryReadJustGranted()) {
             logMessage("Health Connect history read granted — clearing anchors so the next sync re-exports older data")
             resetAnchors()
         }
-        return authorized
+        return true
     }
 
     // -----------------------------------------------------------------------
