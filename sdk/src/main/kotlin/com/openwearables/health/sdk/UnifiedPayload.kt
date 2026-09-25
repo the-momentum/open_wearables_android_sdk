@@ -46,7 +46,8 @@ data class UnifiedRecord(
     val zoneOffset: String?,
     val source: UnifiedSource,
     val value: Double,
-    val unit: String,
+    /** Null for a food parent, which has no nutrient unit. */
+    val unit: String?,
     val parentId: String?,
     val metadata: Map<String, Any?>?
 ) {

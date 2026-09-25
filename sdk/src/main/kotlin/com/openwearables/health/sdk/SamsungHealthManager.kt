@@ -86,6 +86,19 @@ class SamsungHealthManager(
         }
     }
 
+    /** Keep only types whose Samsung Health read permission is actually granted. */
+    private fun retainGrantedTypes(granted: Set<Permission>) {
+        val kept = trackedTypeIds.filter { id ->
+            val dataType = mapToDataType(id) ?: return@filter false
+            Permission.of(dataType, AccessType.READ) in granted
+        }.toSet()
+        val skipped = trackedTypeIds.size - kept.size
+        trackedTypeIds = kept
+        if (skipped > 0) {
+            logger("Skipping $skipped Samsung Health type(s) the user did not grant")
+        }
+    }
+
     private fun collapseSamsungTypeIds(typeIds: List<String>): List<String> {
         val seen = HashSet<String>()
         val kept = ArrayList<String>()
@@ -285,9 +298,9 @@ class SamsungHealthManager(
                 val permissions = dataTypes.map { Permission.of(it, AccessType.READ) }.toSet()
                 logger("Requesting ${permissions.size} Samsung Health permissions...")
                 val granted = store.requestPermissions(permissions, act)
-                val allGranted = granted.size == permissions.size
-                logger(if (allGranted) "All permissions granted" else "Granted ${granted.size}/${permissions.size}")
-                allGranted
+                retainGrantedTypes(granted)
+                logger("Granted ${trackedTypeIds.size}/${permissions.size} Samsung Health type(s)")
+                trackedTypeIds.isNotEmpty()
             } catch (e: Exception) {
                 logger("Permission request failed: ${e.message}")
                 false
@@ -731,6 +744,9 @@ class SamsungHealthManager(
                 val vol = (raw.fields["VOLUME"] as? Number)?.toDouble() ?: return null
                 listOf(UnifiedRecord(raw.uid, "HYDRATION", startDate, endDate, zoneOffset, source, vol, "mL", null, null))
             }
+            in NutritionPayload.trackedTypeIds -> NutritionPayload.fromSamsungFields(
+                raw.uid, startDate, endDate, zoneOffset, source, raw.fields,
+            ).ifEmpty { null }
             "activeEnergy" -> {
                 val cal = (raw.fields["TOTAL_CALORIES"] as? Number)?.toDouble() ?: return null
                 listOf(UnifiedRecord(raw.uid, "ACTIVE_CALORIES_BURNED", startDate, endDate, zoneOffset, source, cal, "kcal", null, null))
@@ -989,6 +1005,7 @@ class SamsungHealthManager(
     // -----------------------------------------------------------------------
 
     private fun mapToDataType(typeId: String): DataType? {
+        if (NutritionPayload.isTrackedType(typeId)) return DataTypes.NUTRITION
         return try {
             when (typeId) {
                 "steps" -> DataTypes.STEPS
@@ -1194,6 +1211,7 @@ class SamsungHealthManager(
         "bodyMass", "bodyFatPercentage", "leanBodyMass", "height", "bmi" -> "BODY_COMPOSITION"
         "activeEnergy" -> "ACTIVITY_SUMMARY"
         "water" -> "WATER_INTAKE"
+        in NutritionPayload.trackedTypeIds -> "NUTRITION"
         "sleep" -> "SLEEP"
         "workout" -> "EXERCISE"
         else -> typeId.uppercase()
@@ -1209,6 +1227,7 @@ class SamsungHealthManager(
         "flightsClimbed" -> extractFloorsClimbedFields(dataPoint)
         "bodyMass", "bodyFatPercentage", "leanBodyMass", "height", "bmi" -> extractBodyCompositionFields(dataPoint)
         "water" -> extractWaterIntakeFields(dataPoint)
+        in NutritionPayload.trackedTypeIds -> extractNutritionFields(dataPoint)
         "workout" -> extractExerciseFields(dataPoint)
         "sleep" -> extractSleepFields(dataPoint)
         else -> emptyMap()
@@ -1279,6 +1298,23 @@ class SamsungHealthManager(
             "FAT_FREE_MASS", "SKELETAL_MUSCLE_MASS", "BMI", "BASAL_METABOLIC_RATE",
         ).forEach { name ->
             getNumberField(DataTypes.BODY_COMPOSITION, name, dp)?.let { fields[name] = it }
+        }
+        return fields
+    }
+
+    private fun extractNutritionFields(dp: HealthDataPoint): Map<String, Any?> {
+        val fields = mutableMapOf<String, Any?>()
+        getFieldValue<String>(DataTypes.NUTRITION, "TITLE", dp)?.let { fields["TITLE"] = it }
+        getFieldValue<Any>(DataTypes.NUTRITION, "MEAL_TYPE", dp)?.let {
+            fields["MEAL_TYPE"] = if (it is Enum<*>) it.name else it.toString()
+        }
+        val numeric = listOf(
+            "CALORIES", "PROTEIN", "CARBOHYDRATE", "DIETARY_FIBER", "SUGAR",
+            "TOTAL_FAT", "SATURATED_FAT", "MONOSATURATED_FAT", "POLYSATURATED_FAT", "TRANS_FAT",
+            "CHOLESTEROL", "SODIUM", "POTASSIUM", "VITAMIN_A", "VITAMIN_C", "CALCIUM", "IRON",
+        )
+        for (name in numeric) {
+            getNumberField(DataTypes.NUTRITION, name, dp)?.let { fields[name] = it }
         }
         return fields
     }

@@ -118,6 +118,19 @@ class HealthConnectManager(
         }
     }
 
+    /** Keep only types whose Health Connect read permission is actually granted. */
+    private fun retainGrantedTypes(grantedPermissions: Set<String>) {
+        val kept = trackedTypeIds.filter { id ->
+            val recordClass = mapToRecordClass(id) ?: return@filter false
+            HealthPermission.getReadPermission(recordClass) in grantedPermissions
+        }.toSet()
+        val skipped = trackedTypeIds.size - kept.size
+        trackedTypeIds = kept
+        if (skipped > 0) {
+            logger("Skipping $skipped Health Connect type(s) the user did not grant")
+        }
+    }
+
     private fun collapseHealthConnectTypeIds(typeIds: List<String>): List<String> {
         val seen = HashSet<String>()
         val kept = ArrayList<String>()
@@ -210,13 +223,14 @@ class HealthConnectManager(
             val historyGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY in totalGranted
             val historyBefore = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY in alreadyGranted
             historyReadJustGranted = historyGranted && !historyBefore
-            val dataPermsGranted = (permissions - optional).all { it in totalGranted }
+            retainGrantedTypes(totalGranted)
+            val requestedData = (permissions - optional).size
             logger(
-                "Data permissions: ${if (dataPermsGranted) "all granted" else "some missing"}, " +
+                "Data permissions: ${trackedTypeIds.size}/$requestedData type(s) granted, " +
                     "background read: ${if (bgGranted) "granted" else "NOT granted"}, " +
                     "history read: ${if (historyGranted) "granted" else "NOT granted — only the last 30 days are readable"}"
             )
-            dataPermsGranted
+            trackedTypeIds.isNotEmpty()
         } catch (e: Exception) {
             logger("Health Connect permission request failed: ${e.message}")
             pendingPermissionResult = null
@@ -293,6 +307,7 @@ class HealthConnectManager(
                 "flightsClimbed" -> readRecordType<FloorsClimbedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertFloors(it) }
                 "distanceWalkingRunning" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
                 "water", "dietaryWater" -> readRecordType<HydrationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHydration(it) }
+                in NutritionPayload.trackedTypeIds -> readRecordType<NutritionRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertNutrition(it) }
                 "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertVo2Max(it) }
                 "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRespiratoryRate(it) }
                 "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
@@ -432,6 +447,7 @@ class HealthConnectManager(
             "distanceWalkingRunning", "distanceCycling" ->
                 convertFiltered(typeId, records.filterIsInstance<DistanceRecord>()) { convertDistance(it) }
             "water", "dietaryWater" -> convertFiltered(typeId, records.filterIsInstance<HydrationRecord>()) { convertHydration(it) }
+            in NutritionPayload.trackedTypeIds -> convertFiltered(typeId, records.filterIsInstance<NutritionRecord>()) { convertNutrition(it) }
             "vo2Max" -> convertFiltered(typeId, records.filterIsInstance<Vo2MaxRecord>()) { convertVo2Max(it) }
             "respiratoryRate" -> convertFiltered(typeId, records.filterIsInstance<RespiratoryRateRecord>()) { convertRespiratoryRate(it) }
             "power", "cyclingPower", "runningPower" ->
@@ -526,6 +542,7 @@ class HealthConnectManager(
         is FloorsClimbedRecord -> record.startTime.toEpochMilli()
         is DistanceRecord -> record.startTime.toEpochMilli()
         is HydrationRecord -> record.startTime.toEpochMilli()
+        is NutritionRecord -> record.startTime.toEpochMilli()
         is Vo2MaxRecord -> record.time.toEpochMilli()
         is RespiratoryRateRecord -> record.time.toEpochMilli()
         is PowerRecord -> record.startTime.toEpochMilli()
@@ -555,6 +572,7 @@ class HealthConnectManager(
         is FloorsClimbedRecord -> record.endTime.toEpochMilli()
         is DistanceRecord -> record.endTime.toEpochMilli()
         is HydrationRecord -> record.endTime.toEpochMilli()
+        is NutritionRecord -> record.endTime.toEpochMilli()
         is Vo2MaxRecord -> record.time.toEpochMilli()
         is RespiratoryRateRecord -> record.time.toEpochMilli()
         // HC time-series metrics added alongside the Peloton fix: needed so
@@ -860,6 +878,86 @@ class HealthConnectManager(
                 zoneStr(r.startZoneOffset), buildSource(r.metadata), r.volume.inLiters * 1000.0, "mL", null, null)
         }
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertNutrition(records: List<NutritionRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = mutableListOf<UnifiedRecord>()
+        for (r in records) {
+            val end = r.endTime.toEpochMilli()
+            if (maxTs == null || end > maxTs) maxTs = end
+            unified += NutritionPayload.records(
+                id = r.metadata.id,
+                startDate = instantToIso(r.startTime),
+                endDate = instantToIso(r.endTime),
+                zoneOffset = zoneStr(r.startZoneOffset),
+                source = buildSource(r.metadata),
+                title = r.name,
+                mealType = healthConnectMealType(r.mealType),
+                nutrients = healthConnectNutrients(r),
+            )
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun healthConnectMealType(mealType: Int): String? = when (mealType) {
+        MealType.MEAL_TYPE_BREAKFAST -> "breakfast"
+        MealType.MEAL_TYPE_LUNCH -> "lunch"
+        MealType.MEAL_TYPE_DINNER -> "dinner"
+        MealType.MEAL_TYPE_SNACK -> "snack"
+        else -> null
+    }
+
+    private fun healthConnectNutrients(r: NutritionRecord): List<NutritionPayload.Nutrient> {
+        val out = ArrayList<NutritionPayload.Nutrient>()
+        fun add(suffix: String, type: String, value: Double?, unit: String) {
+            if (value != null && value.isFinite()) {
+                out += NutritionPayload.Nutrient(suffix, type, value, unit)
+            }
+        }
+        add("energy", "DIETARY_ENERGY", r.energy?.inKilocalories, "kcal")
+        add("energy-from-fat", "DIETARY_ENERGY_FROM_FAT", r.energyFromFat?.inKilocalories, "kcal")
+        add("protein", "DIETARY_PROTEIN", r.protein?.inGrams, "g")
+        add("carbohydrate", "DIETARY_CARBOHYDRATE", r.totalCarbohydrate?.inGrams, "g")
+        add("fiber", "DIETARY_FIBER", r.dietaryFiber?.inGrams, "g")
+        add("sugar", "DIETARY_SUGAR", r.sugar?.inGrams, "g")
+        add("total-fat", "DIETARY_TOTAL_FAT", r.totalFat?.inGrams, "g")
+        add("saturated-fat", "DIETARY_SATURATED_FAT", r.saturatedFat?.inGrams, "g")
+        add("monounsaturated-fat", "DIETARY_MONOUNSATURATED_FAT", r.monounsaturatedFat?.inGrams, "g")
+        add("polyunsaturated-fat", "DIETARY_POLYUNSATURATED_FAT", r.polyunsaturatedFat?.inGrams, "g")
+        add("trans-fat", "DIETARY_TRANS_FAT", r.transFat?.inGrams, "g")
+        add("unsaturated-fat", "DIETARY_UNSATURATED_FAT", r.unsaturatedFat?.inGrams, "g")
+        add("cholesterol", "DIETARY_CHOLESTEROL", r.cholesterol?.inMilligrams, "mg")
+        add("sodium", "DIETARY_SODIUM", r.sodium?.inMilligrams, "mg")
+        add("potassium", "DIETARY_POTASSIUM", r.potassium?.inMilligrams, "mg")
+        add("chloride", "DIETARY_CHLORIDE", r.chloride?.inMilligrams, "mg")
+        add("caffeine", "DIETARY_CAFFEINE", r.caffeine?.inMilligrams, "mg")
+        add("calcium", "DIETARY_CALCIUM", r.calcium?.inMilligrams, "mg")
+        add("iron", "DIETARY_IRON", r.iron?.inMilligrams, "mg")
+        add("magnesium", "DIETARY_MAGNESIUM", r.magnesium?.inMilligrams, "mg")
+        add("phosphorus", "DIETARY_PHOSPHORUS", r.phosphorus?.inMilligrams, "mg")
+        add("zinc", "DIETARY_ZINC", r.zinc?.inMilligrams, "mg")
+        add("copper", "DIETARY_COPPER", r.copper?.inMilligrams, "mg")
+        add("manganese", "DIETARY_MANGANESE", r.manganese?.inMilligrams, "mg")
+        add("selenium", "DIETARY_SELENIUM", r.selenium?.inMicrograms, "mcg")
+        add("chromium", "DIETARY_CHROMIUM", r.chromium?.inMicrograms, "mcg")
+        add("molybdenum", "DIETARY_MOLYBDENUM", r.molybdenum?.inMicrograms, "mcg")
+        add("iodine", "DIETARY_IODINE", r.iodine?.inMicrograms, "mcg")
+        add("vitamin-a", "DIETARY_VITAMIN_A", r.vitaminA?.inMicrograms, "mcg")
+        add("vitamin-b6", "DIETARY_VITAMIN_B6", r.vitaminB6?.inMilligrams, "mg")
+        add("vitamin-b12", "DIETARY_VITAMIN_B12", r.vitaminB12?.inMicrograms, "mcg")
+        add("vitamin-c", "DIETARY_VITAMIN_C", r.vitaminC?.inMilligrams, "mg")
+        add("vitamin-d", "DIETARY_VITAMIN_D", r.vitaminD?.inMicrograms, "mcg")
+        add("vitamin-e", "DIETARY_VITAMIN_E", r.vitaminE?.inMilligrams, "mg")
+        add("vitamin-k", "DIETARY_VITAMIN_K", r.vitaminK?.inMicrograms, "mcg")
+        add("thiamin", "DIETARY_THIAMIN", r.thiamin?.inMilligrams, "mg")
+        add("riboflavin", "DIETARY_RIBOFLAVIN", r.riboflavin?.inMilligrams, "mg")
+        add("niacin", "DIETARY_NIACIN", r.niacin?.inMilligrams, "mg")
+        add("folate", "DIETARY_FOLATE", r.folate?.inMicrograms, "mcg")
+        add("folic-acid", "DIETARY_FOLIC_ACID", r.folicAcid?.inMicrograms, "mcg")
+        add("biotin", "DIETARY_BIOTIN", r.biotin?.inMicrograms, "mcg")
+        add("pantothenic-acid", "DIETARY_PANTOTHENIC_ACID", r.pantothenicAcid?.inMilligrams, "mg")
+        return out
     }
 
     // Flatten a PowerRecord (which, like HeartRateRecord, carries a list of
@@ -1422,6 +1520,7 @@ class HealthConnectManager(
         "flightsClimbed" -> FloorsClimbedRecord::class
         "distanceWalkingRunning" -> DistanceRecord::class
         "water", "dietaryWater" -> HydrationRecord::class
+        in NutritionPayload.trackedTypeIds -> NutritionRecord::class
         "vo2Max" -> Vo2MaxRecord::class
         "respiratoryRate" -> RespiratoryRateRecord::class
         "distanceCycling" -> DistanceRecord::class

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* **Partial health permissions**: granting only some data types on the system screen is enough to continue. Sync uploads those types and skips the ones that were denied. Background and history reads stay optional.
+* **Nutrition meals**: Health Connect `NutritionRecord` and Samsung `NutritionType` are uploaded as a `FOOD` parent plus one child record per filled nutrient (`DIETARY_ENERGY`, `DIETARY_PROTEIN`, …) with `parentId` pointing at the meal. A nutrient with no meal name and no meal type is sent on its own. Samsung does not have caffeine or most vitamins, so those rows are absent. Water stays `HYDRATION`.
+
 ## 0.13.0
 
 * **Optional mTLS client certificates** (#34, #16): the shared OkHttp client can present a client cert from the Android KeyChain (`pickClientCertificate` / `clearClientCertificate`) or a bundled `.p12` in assets. No cert configured = plain TLS, so existing backends keep working. The HTTP client reloads at runtime when the alias changes.
