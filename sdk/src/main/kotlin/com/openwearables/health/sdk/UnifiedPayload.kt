@@ -46,7 +46,8 @@ data class UnifiedRecord(
     val zoneOffset: String?,
     val source: UnifiedSource,
     val value: Double,
-    val unit: String,
+    /** Null for category records that have no physical unit. */
+    val unit: String?,
     val parentId: String?,
     val metadata: Map<String, Any?>?
 ) {

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* **Health Connect women's health** (#17): menstruation flow, menstruation period, intermenstrual bleeding, cervical mucus, ovulation test, sexual activity, and basal body temperature sync as `records`. Category fields keep the Health Connect number in `value` and the name in `metadata`. `unit` is null when there is no physical unit. Basal body temperature is `°C` and stays separate from `BODY_TEMPERATURE`. Samsung Health has no matching types.
+
 ## 0.13.1
 
 * **Partial health permissions**: granting some data types is enough. Sync uploads those types and the example shows Start Sync after that screen, without a second Authorize tap. The permission screen opens on the main thread. Opening it from the Health Connect callback thread makes Android cancel the request and report no grants. On Android 14+ data types are requested separately from background and history, and an instant empty platform result falls back to the Health Connect app screen. When every requested data type is already granted, the permission screen stays closed.
