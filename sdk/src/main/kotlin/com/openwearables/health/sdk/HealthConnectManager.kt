@@ -408,6 +408,13 @@ class HealthConnectManager(
                 "speed", "cyclingSpeed", "runningSpeed" -> readRecordType<SpeedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSpeed(it) }
                 "totalCaloriesBurned", "totalEnergy" -> readRecordType<TotalCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertTotalCalories(it) }
                 "cyclingPedalingCadence", "cyclingCadence" -> readRecordType<CyclingPedalingCadenceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCyclingCadence(it) }
+                "menstrualFlow" -> readRecordType<MenstruationFlowRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertMenstrualFlow(it) }
+                "menstrualPeriod" -> readRecordType<MenstruationPeriodRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertMenstrualPeriod(it) }
+                "intermenstrualBleeding" -> readRecordType<IntermenstrualBleedingRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertIntermenstrualBleeding(it) }
+                "cervicalMucusQuality" -> readRecordType<CervicalMucusRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertCervicalMucus(it) }
+                "ovulationTestResult" -> readRecordType<OvulationTestRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertOvulationTest(it) }
+                "sexualActivity" -> readRecordType<SexualActivityRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSexualActivity(it) }
+                "basalBodyTemperature" -> readRecordType<BasalBodyTemperatureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBasalBodyTemperature(it) }
                 "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
@@ -545,6 +552,13 @@ class HealthConnectManager(
                 convertFiltered(typeId, records.filterIsInstance<TotalCaloriesBurnedRecord>()) { convertTotalCalories(it) }
             "cyclingPedalingCadence", "cyclingCadence" ->
                 convertFiltered(typeId, records.filterIsInstance<CyclingPedalingCadenceRecord>()) { convertCyclingCadence(it) }
+            "menstrualFlow" -> convertFiltered(typeId, records.filterIsInstance<MenstruationFlowRecord>()) { convertMenstrualFlow(it) }
+            "menstrualPeriod" -> convertFiltered(typeId, records.filterIsInstance<MenstruationPeriodRecord>()) { convertMenstrualPeriod(it) }
+            "intermenstrualBleeding" -> convertFiltered(typeId, records.filterIsInstance<IntermenstrualBleedingRecord>()) { convertIntermenstrualBleeding(it) }
+            "cervicalMucusQuality" -> convertFiltered(typeId, records.filterIsInstance<CervicalMucusRecord>()) { convertCervicalMucus(it) }
+            "ovulationTestResult" -> convertFiltered(typeId, records.filterIsInstance<OvulationTestRecord>()) { convertOvulationTest(it) }
+            "sexualActivity" -> convertFiltered(typeId, records.filterIsInstance<SexualActivityRecord>()) { convertSexualActivity(it) }
+            "basalBodyTemperature" -> convertFiltered(typeId, records.filterIsInstance<BasalBodyTemperatureRecord>()) { convertBasalBodyTemperature(it) }
             "workout" -> {
                 val sessions = records.filterIsInstance<ExerciseSessionRecord>()
                 val (plausible, _) = filterRecordsWithImplausibleTimestamps("workout", sessions)
@@ -871,6 +885,105 @@ class HealthConnectManager(
         }
         return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
     }
+
+    private fun convertMenstrualFlow(records: List<MenstruationFlowRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val ts = r.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            instantaneousRecord(r.metadata, r.time, r.zoneOffset, "MENSTRUAL_FLOW", r.flow.toDouble(),
+                mapOf("flow" to categoryName(MenstruationFlowRecord.FLOW_TYPE_INT_TO_STRING_MAP, r.flow)))
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertMenstrualPeriod(records: List<MenstruationPeriodRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val ts = r.endTime.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            UnifiedRecord(
+                r.metadata.id, "MENSTRUAL_PERIOD",
+                instantToIso(r.startTime), instantToIso(r.endTime),
+                zoneStr(r.startZoneOffset), buildSource(r.metadata),
+                1.0, null, null, null,
+            )
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertIntermenstrualBleeding(records: List<IntermenstrualBleedingRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val ts = r.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            instantaneousRecord(r.metadata, r.time, r.zoneOffset, "INTERMENSTRUAL_BLEEDING", 1.0, null)
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertCervicalMucus(records: List<CervicalMucusRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val ts = r.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            instantaneousRecord(r.metadata, r.time, r.zoneOffset, "CERVICAL_MUCUS", r.appearance.toDouble(),
+                mapOf(
+                    "appearance" to categoryName(CervicalMucusRecord.APPEARANCE_INT_TO_STRING_MAP, r.appearance),
+                    "sensation" to categoryName(CervicalMucusRecord.SENSATION_INT_TO_STRING_MAP, r.sensation),
+                ))
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertOvulationTest(records: List<OvulationTestRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val ts = r.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            instantaneousRecord(r.metadata, r.time, r.zoneOffset, "OVULATION_TEST", r.result.toDouble(),
+                mapOf("result" to categoryName(OvulationTestRecord.RESULT_INT_TO_STRING_MAP, r.result)))
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertSexualActivity(records: List<SexualActivityRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val ts = r.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            instantaneousRecord(r.metadata, r.time, r.zoneOffset, "SEXUAL_ACTIVITY", r.protectionUsed.toDouble(),
+                mapOf("protectionUsed" to categoryName(SexualActivityRecord.PROTECTION_USED_INT_TO_STRING_MAP, r.protectionUsed)))
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun convertBasalBodyTemperature(records: List<BasalBodyTemperatureRecord>): ProviderReadResult {
+        var maxTs: Long? = null
+        val unified = records.map { r ->
+            val ts = r.time.toEpochMilli(); if (maxTs == null || ts > maxTs!!) maxTs = ts
+            val meta = if (r.measurementLocation != 0)
+                mapOf("measurementLocation" to mapTempLocation(r.measurementLocation)) else null
+            UnifiedRecord(
+                r.metadata.id, "BASAL_BODY_TEMPERATURE",
+                instantToIso(r.time), instantToIso(r.time),
+                zoneStr(r.zoneOffset), buildSource(r.metadata),
+                r.temperature.inCelsius, "°C", null, meta,
+            )
+        }
+        return ProviderReadResult(UnifiedHealthData(records = unified), maxTs)
+    }
+
+    private fun instantaneousRecord(
+        metadata: Metadata,
+        time: Instant,
+        zoneOffset: ZoneOffset?,
+        type: String,
+        value: Double,
+        extra: Map<String, Any?>?,
+    ): UnifiedRecord {
+        val iso = instantToIso(time)
+        return UnifiedRecord(
+            metadata.id, type, iso, iso, zoneStr(zoneOffset), buildSource(metadata),
+            value, null, null, extra,
+        )
+    }
+
+    private fun categoryName(labels: Map<Int, String>, value: Int): String = labels[value] ?: "unknown"
 
     private fun convertBodyTemperature(records: List<BodyTemperatureRecord>): ProviderReadResult {
         var maxTs: Long? = null
@@ -1536,6 +1649,13 @@ class HealthConnectManager(
         "speed", "cyclingSpeed", "runningSpeed" -> SpeedRecord::class
         "totalCaloriesBurned", "totalEnergy" -> TotalCaloriesBurnedRecord::class
         "cyclingPedalingCadence", "cyclingCadence" -> CyclingPedalingCadenceRecord::class
+        "menstrualFlow" -> MenstruationFlowRecord::class
+        "menstrualPeriod" -> MenstruationPeriodRecord::class
+        "intermenstrualBleeding" -> IntermenstrualBleedingRecord::class
+        "cervicalMucusQuality" -> CervicalMucusRecord::class
+        "ovulationTestResult" -> OvulationTestRecord::class
+        "sexualActivity" -> SexualActivityRecord::class
+        "basalBodyTemperature" -> BasalBodyTemperatureRecord::class
         "workout" -> ExerciseSessionRecord::class
         "sleep" -> SleepSessionRecord::class
         else -> null
