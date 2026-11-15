@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* **Health Connect authorization no longer fails after the data grant**: when the user granted data types, `requestAuthorization` returns `true` even if the follow-up background/history request fails. Before, on Android 14+ without the Health Connect app package, that request returned instantly, the fallback sent `androidx.health.ACTION_REQUEST_PERMISSIONS` to `com.google.android.apps.healthdata`, the launch threw `ActivityNotFoundException` and the whole call returned `false` ("Authorization denied"). Background and history read are now requested only when `HealthConnectClient.features` reports them available, and the Health Connect app screen fallback runs only when an installed activity resolves its intent.
+
 ## 0.13.1
 
 * **Partial health permissions**: granting some data types is enough. Sync uploads those types and the example shows Start Sync after that screen, without a second Authorize tap. The permission screen opens on the main thread. Opening it from the Health Connect callback thread makes Android cancel the request and report no grants. On Android 14+ data types are requested separately from background and history, and an instant empty platform result falls back to the Health Connect app screen. When every requested data type is already granted, the permission screen stays closed.

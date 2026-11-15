@@ -1,6 +1,7 @@
 package com.openwearables.health.sdk
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
@@ -8,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.HealthConnectFeatures
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
@@ -17,6 +19,7 @@ import androidx.health.connect.client.changes.UpsertionChange
 import androidx.health.connect.client.request.ChangesTokenRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -41,6 +44,7 @@ class HealthConnectManager(
     private var permissionLauncher: ActivityResultLauncher<Set<String>>? = null
     /** Pre-Android 14 Health Connect app screen. Used when the platform dialog returns instantly with nothing. */
     private var appPermissionLauncher: ActivityResultLauncher<Set<String>>? = null
+    private var appPermissionContract: ActivityResultContract<Set<String>, Set<String>>? = null
 
     /** Set when this authorize call is the one that first obtains history read. */
     private var historyReadJustGranted = false
@@ -92,6 +96,7 @@ class HealthConnectManager(
                 onResult
             )
             healthConnectAppContract()?.let { contract ->
+                appPermissionContract = contract
                 appPermissionLauncher = act.activityResultRegistry.register(
                     "health_connect_permissions_app",
                     contract,
@@ -128,6 +133,7 @@ class HealthConnectManager(
         appPermissionLauncher?.unregister()
         permissionLauncher = null
         appPermissionLauncher = null
+        appPermissionContract = null
         launcherRegistered = false
     }
 
@@ -211,21 +217,14 @@ class HealthConnectManager(
 
         val permissions = typeIds.mapNotNull { typeId ->
             mapToRecordClass(typeId)?.let { HealthPermission.getReadPermission(it) }
-        }.toMutableSet()
+        }.toSet()
 
         if (permissions.isEmpty()) {
             logger("No valid Health Connect types to authorize")
             return false
         }
 
-        permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
-        permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY)
-
-        val optional = setOf(
-            HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND,
-            HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY,
-        )
-        val dataPermissions = permissions - optional
+        val dataPermissions: Set<String> = permissions
 
         if (client == null && !connect()) return false
         val hcClient = client ?: return false
@@ -258,26 +257,43 @@ class HealthConnectManager(
                 return false
             }
 
-            val missingOptional = setOf(
-                HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND,
-                HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY,
-            ) - totalGranted
-            val fromOptionalDialog = launchPermissionRequest(launcher, missingOptional)
-            if (fromOptionalDialog.isNotEmpty() || missingOptional.isNotEmpty()) {
-                totalGranted = totalGranted + fromOptionalDialog + hcClient.permissionController.getGrantedPermissions()
+            val backgroundSupported = isFeatureAvailable(hcClient, HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND)
+            val historySupported = isFeatureAvailable(hcClient, HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_HISTORY)
+            val missingOptional = HealthConnectPermissionPolicy.optionalPermissionsToRequest(
+                backgroundSupported = backgroundSupported,
+                historySupported = historySupported,
+                granted = totalGranted,
+            )
+            if (missingOptional.isNotEmpty()) {
+                // Data types are granted at this point. Nothing below may turn that into a failure.
+                val fromOptionalDialog = HealthConnectPermissionPolicy.requestOptional(missingOptional, logger) {
+                    launchPermissionRequest(launcher, it)
+                }
+                val controllerGranted = try {
+                    hcClient.permissionController.getGrantedPermissions()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger("Health Connect granted permissions re-check failed: ${e.message}")
+                    emptySet()
+                }
+                totalGranted = totalGranted + fromOptionalDialog + controllerGranted
             }
 
-            val bgGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in totalGranted
-            val historyGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY in totalGranted
-            val historyBefore = HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY in alreadyGranted
+            val bgGranted = HealthConnectPermissionPolicy.BACKGROUND in totalGranted
+            val historyGranted = HealthConnectPermissionPolicy.HISTORY in totalGranted
+            val historyBefore = HealthConnectPermissionPolicy.HISTORY in alreadyGranted
             historyReadJustGranted = historyGranted && !historyBefore
             retainGrantedTypes(totalGranted)
             logger(
                 "Health Connect granted ${trackedTypeIds.size}/${dataPermissions.size} type(s), " +
-                    "background read: ${if (bgGranted) "granted" else "NOT granted"}, " +
-                    "history read: ${if (historyGranted) "granted" else "NOT granted — only the last 30 days are readable"}"
+                    "background read: ${optionalStatus(bgGranted, backgroundSupported)}, " +
+                    "history read: ${optionalStatus(historyGranted, historySupported)}" +
+                    if (historyGranted) "" else " (only the last 30 days are readable)"
             )
             true
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             logger("Health Connect permission request failed: ${e.message}")
             pendingPermissionResult = null
@@ -302,13 +318,51 @@ class HealthConnectManager(
         if (permissions.isEmpty()) return emptySet()
         val startedAt = SystemClock.elapsedRealtime()
         val granted = launchPermissionRequestOnMain(launcher, permissions)
-        val instantCancel = granted.isEmpty() && SystemClock.elapsedRealtime() - startedAt < 800
-        val appLauncher = appPermissionLauncher
-        if (instantCancel && Build.VERSION.SDK_INT >= 34 && appLauncher != null && launcher !== appLauncher) {
-            logger("Platform permission dialog returned immediately with no grants. Opening the Health Connect app screen.")
-            return launchPermissionRequestOnMain(appLauncher, permissions)
+        val instantCancel = HealthConnectPermissionPolicy.isInstantCancel(
+            granted, SystemClock.elapsedRealtime() - startedAt
+        )
+        if (!instantCancel || Build.VERSION.SDK_INT < HealthConnectPermissionPolicy.HEALTH_CONNECT_MODULE_SDK) {
+            return granted
         }
-        return granted
+        val appLauncher = appPermissionLauncher?.takeIf { it !== launcher }
+        val resolvable = appLauncher != null && canOpenAppScreen(permissions)
+        if (!HealthConnectPermissionPolicy.shouldOpenAppScreen(instantCancel, Build.VERSION.SDK_INT, resolvable)) {
+            logger("Platform permission dialog returned immediately with no grants. Health Connect app screen is not installed, keeping the result.")
+            return granted
+        }
+        logger("Platform permission dialog returned immediately with no grants. Opening the Health Connect app screen.")
+        return try {
+            launchPermissionRequestOnMain(appLauncher!!, permissions)
+        } catch (e: ActivityNotFoundException) {
+            logger("Health Connect app screen could not be opened: ${e.message}")
+            granted
+        }
+    }
+
+    /** True when an installed activity handles the Health Connect app permission screen intent. */
+    private fun canOpenAppScreen(permissions: Set<String>): Boolean {
+        val contract = appPermissionContract ?: return false
+        return try {
+            val intent = contract.createIntent(context, permissions)
+            @Suppress("DEPRECATION")
+            context.packageManager.resolveActivity(intent, 0) != null
+        } catch (e: Exception) {
+            logger("Health Connect app screen lookup failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun isFeatureAvailable(hcClient: HealthConnectClient, feature: Int): Boolean = try {
+        hcClient.features.getFeatureStatus(feature) == HealthConnectFeatures.FEATURE_STATUS_AVAILABLE
+    } catch (e: Exception) {
+        logger("Health Connect feature $feature status check failed: ${e.message}")
+        false
+    }
+
+    private fun optionalStatus(granted: Boolean, supported: Boolean): String = when {
+        granted -> "granted"
+        !supported -> "not supported by this Health Connect version"
+        else -> "NOT granted"
     }
 
     private suspend fun launchPermissionRequestOnMain(
@@ -320,12 +374,14 @@ class HealthConnectManager(
         logger(
             "Launching Health Connect permission dialog for ${permissions.size} permissions (api ${Build.VERSION.SDK_INT})"
         )
-        withContext(Dispatchers.Main.immediate) {
-            launcher.launch(permissions)
+        try {
+            withContext(Dispatchers.Main.immediate) {
+                launcher.launch(permissions)
+            }
+            return deferred.await()
+        } finally {
+            if (pendingPermissionResult === deferred) pendingPermissionResult = null
         }
-        val granted = deferred.await()
-        pendingPermissionResult = null
-        return granted
     }
 
     /**
