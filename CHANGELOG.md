@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.2
+
 * **Health Connect authorization no longer fails after the data grant**: when the user granted data types, `requestAuthorization` returns `true` even if the follow-up background/history request fails. Before, on Android 14+ without the Health Connect app package, that request returned instantly, the fallback sent `androidx.health.ACTION_REQUEST_PERMISSIONS` to `com.google.android.apps.healthdata`, the launch threw `ActivityNotFoundException` and the whole call returned `false` ("Authorization denied"). Background and history read are now requested only when `HealthConnectClient.features` reports them available, and the Health Connect app screen fallback runs only when an installed activity resolves its intent.
 
 ## 0.13.1
