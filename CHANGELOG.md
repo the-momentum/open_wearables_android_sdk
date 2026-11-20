@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.3
+
 * **Release builds with AGP 9 no longer crash on start**: apps built with Android Gradle Plugin 9.0 (R8 9.0) and `isMinifyEnabled = true` crashed before the first frame with `Unable to get provider androidx.startup.InitializationProvider ... Failed to create an instance of class androidx.work.impl.WorkDatabase`. WorkManager 2.9.0 pulled Room 2.5.0, whose bundled rule `-keep class * extends androidx.room.RoomDatabase` has no member spec, and R8 9.0 removes the no-arg constructor of `WorkDatabase_Impl` that Room calls by reflection. R8 8.x (AGP 8.9.1 checked) kept it, so AGP 8 apps were not affected. WorkManager is now 2.12.0 (Room 2.7.0, which keeps the constructor), and `consumer-rules.pro` keeps `RoomDatabase` subclasses' no-arg constructors and `androidx.room.Room` for apps whose dependency graph resolves an older Room. Apps that added these keep rules themselves can drop them after upgrading.
 
 ## 0.13.2
