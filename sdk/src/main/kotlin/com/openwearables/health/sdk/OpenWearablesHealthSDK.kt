@@ -284,16 +284,12 @@ class OpenWearablesHealthSDK private constructor(
     }
 
     /**
-     * Customize the foreground notification shown during background sync.
-     *
-     * @param title Notification title (default: "Health Sync")
-     * @param text  Notification body text (default: "Syncing health data...")
+     * No-op. Background sync no longer runs as a foreground service, so there
+     * is no sync notification to customize. Kept so existing callers compile.
      */
-    fun setSyncNotification(title: String? = null, text: String? = null) {
-        title?.let { secureStorage.saveNotificationTitle(it) }
-        text?.let { secureStorage.saveNotificationText(it) }
-        logMessage("Sync notification updated: title=${title ?: "(unchanged)"}, text=${text ?: "(unchanged)"}")
-    }
+    @Deprecated("Background sync no longer shows a notification; this call does nothing.")
+    @Suppress("UNUSED_PARAMETER")
+    fun setSyncNotification(title: String? = null, text: String? = null) = Unit
 
     private suspend fun autoRestoreSync() {
         val h = host
@@ -652,17 +648,8 @@ class OpenWearablesHealthSDK private constructor(
         return provider
     }
 
-    private fun resolveProvider(providerId: String?): HealthDataProvider = when (providerId) {
-        ProviderIds.GOOGLE -> healthConnectManager
-        ProviderIds.SAMSUNG -> samsungHealthManager
-        else -> autoSelectProvider()
-    }
-
-    private fun autoSelectProvider(): HealthDataProvider {
-        if (samsungHealthManager.isAvailable()) return samsungHealthManager
-        if (healthConnectManager.isAvailable()) return healthConnectManager
-        return samsungHealthManager
-    }
+    private fun resolveProvider(providerId: String?): HealthDataProvider =
+        selectProvider(providerId, { samsungHealthManager }, { healthConnectManager })
 
     private fun rebuildSyncManager() {
         val provider = activeProvider ?: return

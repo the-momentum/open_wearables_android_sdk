@@ -263,7 +263,10 @@ class SyncManager(
             ))
         if (initialDelayMs > 0L) {
             builder.setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
-        } else {
+        } else if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            // Android 12+ runs expedited work as an expedited job. Below that
+            // WorkManager would run it as a foreground service, which the SDK
+            // no longer declares.
             builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
         }
         val expeditedWork = builder.build()
