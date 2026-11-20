@@ -7,7 +7,7 @@ Native Android SDK for reading and syncing health data from **Samsung Health** a
 ## Features
 
 - **Dual Provider Support** - Samsung Health and Health Connect through a unified API
-- **Background Sync** - WorkManager-based periodic sync with foreground service support
+- **Background Sync** - WorkManager-based periodic sync
 - **Resumable Sync** - Interrupted syncs resume from where they left off
 - **Token Auth + Auto-Refresh** - Access/refresh tokens with automatic 401 retry
 - **API Key Auth** - Simpler alternative for server-to-server setups
@@ -83,7 +83,7 @@ dependencies {
 
 ### Step 3: Configure AndroidManifest.xml
 
-The SDK's manifest is automatically merged into your app via manifest merger. It declares all required permissions (Health Connect, foreground service, internet, etc.) and the WorkManager foreground service.
+The SDK's manifest is automatically merged into your app via manifest merger. It declares all required permissions (Health Connect, internet, network state). It declares no foreground service, so apps do not need the Play Console foreground service declaration for the SDK.
 
 You need to add Health Connect permission rationale activities to your app's manifest:
 
@@ -287,7 +287,7 @@ sdk.destroy()
 │  └── Resumable sync state (file-based)            │
 ├─────────────────────────────────────────────────┤
 │ HealthSyncWorker (WorkManager CoroutineWorker)   │
-│  └── Runs sync in background as foreground svc   │
+│  └── Runs sync in background (no foreground svc) │
 ├─────────────────────────────────────────────────┤
 │ SecureStorage (EncryptedSharedPreferences)        │
 │  └── Credentials, config, anchors                │

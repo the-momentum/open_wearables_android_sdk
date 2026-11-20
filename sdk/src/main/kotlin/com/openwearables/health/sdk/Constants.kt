@@ -39,11 +39,3 @@ object StorageKeys {
     const val SYNC_STATE_DIR = "health_sync_state"
     const val SYNC_STATE_FILE = "state.json"
 }
-
-object NotificationConfig {
-    const val NOTIFICATION_ID = 9001
-    const val CHANNEL_ID = "health_sync_channel"
-    const val CHANNEL_NAME = "Health Sync"
-    const val CHANNEL_DESCRIPTION = "Background health data synchronization"
-    const val DEFAULT_TEXT = "Syncing health data..."
-}
