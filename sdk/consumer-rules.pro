@@ -7,3 +7,8 @@
 # resolves an older Room.
 -keep class * extends androidx.room.RoomDatabase { <init>(); }
 -keep class androidx.room.Room { *; }
+
+# The Samsung Health Data SDK is compile-only. Apps that use Samsung Health add its
+# AAR, whose own rules keep its classes. Without these lines, R8 fails release builds
+# of apps that leave it out with "Missing class com.samsung.android.sdk.health.data...".
+-dontwarn com.samsung.android.sdk.health.data.**

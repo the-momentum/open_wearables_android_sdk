@@ -532,6 +532,7 @@ class OpenWearablesHealthSDK private constructor(
     // -----------------------------------------------------------------------
 
     fun setProvider(providerId: String): Boolean {
+        if (providerId == ProviderIds.SAMSUNG && !samsungSdkAvailable()) return false
         val provider = when (providerId) {
             ProviderIds.SAMSUNG -> samsungHealthManager
             ProviderIds.GOOGLE -> healthConnectManager
@@ -560,11 +561,14 @@ class OpenWearablesHealthSDK private constructor(
     }
 
     fun getAvailableProviders(): List<Map<String, Any>> = listOf(
-        mapOf(
-            "id" to ProviderIds.SAMSUNG,
-            "displayName" to ProviderDisplayNames.SAMSUNG_HEALTH,
-            "isAvailable" to samsungHealthManager.isAvailable()
-        ),
+        buildMap {
+            put("id", ProviderIds.SAMSUNG)
+            put("displayName", ProviderDisplayNames.SAMSUNG_HEALTH)
+            put("isAvailable", samsungHealthManager.isAvailable())
+            if (!SamsungHealthSdk.isPresent) {
+                put("unavailableReason", SamsungHealthSdk.UNAVAILABLE_REASON_SDK_MISSING)
+            }
+        },
         mapOf(
             "id" to ProviderIds.GOOGLE,
             "displayName" to ProviderDisplayNames.HEALTH_CONNECT,
@@ -648,8 +652,20 @@ class OpenWearablesHealthSDK private constructor(
         return provider
     }
 
-    private fun resolveProvider(providerId: String?): HealthDataProvider =
-        selectProvider(providerId, { samsungHealthManager }, { healthConnectManager })
+    private fun resolveProvider(providerId: String?): HealthDataProvider {
+        // Keep a stored Samsung provider even without the Samsung SDK: switching to
+        // Health Connect would export a different store. Sync stays off until the app adds it.
+        if (providerId == ProviderIds.SAMSUNG) samsungSdkAvailable()
+        return selectProvider(providerId, { samsungHealthManager }, { healthConnectManager })
+    }
+
+    /**
+     * Whether the app ships the Samsung Health Data SDK. Without it, debuggable apps
+     * throw and release builds log, see [SamsungHealthSdk.checkRequested].
+     */
+    private fun samsungSdkAvailable(): Boolean =
+        SamsungHealthSdk.isPresent ||
+            SamsungHealthSdk.checkRequested(SamsungHealthSdk.isDebuggable(context), ::logMessage, isPresent = false)
 
     private fun rebuildSyncManager() {
         val provider = activeProvider ?: return

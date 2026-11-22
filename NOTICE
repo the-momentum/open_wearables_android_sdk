@@ -1,0 +1,17 @@
+Open Wearables Android SDK
+Copyright (c) 2026 Momentum
+
+This product is licensed under the MIT License (see LICENSE).
+
+Third-party components keep their own licenses. In particular:
+
+Samsung Health Data SDK
+The Samsung Health Data SDK is proprietary software licensed by Samsung under
+its own terms. It is not included in this repository or in the published SDK
+artifact, and the MIT License does not apply to it. Apps that use the Samsung
+Health provider obtain the SDK from Samsung and are responsible for complying
+with Samsung's terms.
+
+The samsung-health-stub module declares only the names and signatures of the
+Samsung Health Data SDK API that this SDK calls, so the SDK can be compiled
+without Samsung's binary. It contains no Samsung code and is not published.
