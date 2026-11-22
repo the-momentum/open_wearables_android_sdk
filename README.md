@@ -42,7 +42,7 @@ Native Android SDK for reading and syncing health data from **Samsung Health** a
 
 - Samsung device
 - Samsung Health app v6.30.2+
-- Samsung Health Data SDK is bundled in the repository (no manual download needed)
+- Samsung Health Data SDK `.aar`, downloaded from Samsung and added to your app module (see [Samsung Health](#samsung-health))
 
 ### For Health Connect
 
@@ -61,7 +61,7 @@ cd open_wearables_android_sdk
 ./gradlew :sdk:publishReleasePublicationToMavenLocal
 ```
 
-This publishes `com.openwearables.health:sdk:0.1.0` and the Samsung Health SDK to your local Maven repository (`~/.m2/repository/`).
+This publishes `com.openwearables.health:sdk:0.1.0` to your local Maven repository (`~/.m2/repository/`).
 
 ### Step 2: Add dependency
 
@@ -117,9 +117,19 @@ You need to add Health Connect permission rationale activities to your app's man
 
 ### Samsung Health
 
-The Samsung Health Data SDK `.aar` is bundled in the repository at `sdk/libs/maven/` - no manual download needed.
+The Samsung Health Data SDK is proprietary software licensed by Samsung, so it is not part of this SDK. Apps that use the `"samsung"` provider add it themselves. Apps that only use Health Connect skip this section.
 
-When you run `publishReleasePublicationToMavenLocal`, the Samsung SDK is also installed to `~/.m2/repository/` so consuming apps can resolve it.
+1. Download the Samsung Health Data SDK from the [Samsung Health Data SDK page](https://developer.samsung.com/health/data/overview.html).
+2. Copy the `.aar` file to your app module, e.g. `app/libs/`.
+3. Add it to your app's `build.gradle.kts`:
+
+```kotlin
+dependencies {
+    implementation(files("libs/samsung-health-data-api.aar"))
+}
+```
+
+Without the AAR, Samsung Health is reported as unavailable: `getAvailableProviders()` returns `"isAvailable": false` with `"unavailableReason": "samsungSdkMissing"`. In debuggable builds, `setProvider("samsung")` and a stored `"samsung"` provider throw `IllegalStateException`, so a missing AAR shows up during development. Release builds log a warning and `setProvider("samsung")` returns `false`.
 
 For testing on Samsung devices, enable Developer Mode in Samsung Health:
 Settings > About Samsung Health > tap version 10 times > Developer options > enable Developer mode.
@@ -192,6 +202,8 @@ sdk.signIn(
 val providers = sdk.getAvailableProviders()
 // [{"id": "samsung", "displayName": "Samsung Health", "isAvailable": true},
 //  {"id": "google", "displayName": "Health Connect", "isAvailable": true}]
+// Without the Samsung Health Data SDK in the app, the Samsung entry also has
+// "unavailableReason": "samsungSdkMissing".
 
 sdk.setProvider("samsung")  // or "google"
 ```
@@ -347,4 +359,6 @@ The AAR output is at `sdk/build/outputs/aar/sdk-release.aar`.
 
 ## License
 
-MIT License
+The Open Wearables Android SDK is licensed under the [MIT License](LICENSE).
+
+The Samsung Health Data SDK is proprietary software licensed separately by Samsung. It is not part of this repository and the MIT License does not cover it. See [NOTICE](NOTICE).

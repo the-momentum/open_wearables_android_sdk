@@ -48,6 +48,12 @@ class HealthSyncWorker(
         if (host.isNullOrEmpty()) return Result.failure()
         val customSyncUrl = inputData.getString(KEY_CUSTOM_SYNC_URL) ?: secureStorage.getCustomSyncUrl()
 
+        // Retrying cannot help until the app ships the Samsung Health Data SDK.
+        if (secureStorage.getProvider() == ProviderIds.SAMSUNG && !SamsungHealthSdk.isPresent) {
+            android.util.Log.e("HealthSyncWorker", SamsungHealthSdk.MISSING_MESSAGE)
+            return Result.failure()
+        }
+
         val dispatchers = DefaultDispatcherProvider()
         val provider = createProvider(applicationContext, secureStorage, dispatchers)
         val syncManager = SyncManager(

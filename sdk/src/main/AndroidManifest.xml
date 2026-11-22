@@ -47,6 +47,6 @@
     <!-- Package visibility: allow detecting Health Connect and Samsung Health on Android 11+ -->
     <queries>
         <package android:name="com.google.android.apps.healthdata" />
-        <package android:name="com.samsung.android.app.shealth" />
+        <package android:name="com.sec.android.app.shealth" />
     </queries>
 </manifest>

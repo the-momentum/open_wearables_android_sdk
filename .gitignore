@@ -3,6 +3,8 @@
 /local.properties
 /.idea
 /sdk/build
+/samsung-health-stub/build
+/samsung-sdk/*.aar
 /build
 .DS_Store
 /captures

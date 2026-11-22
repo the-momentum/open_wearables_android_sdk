@@ -34,14 +34,25 @@ android {
 repositories {
     google()
     mavenCentral()
-    maven {
-        url = uri("${project.projectDir}/libs/maven")
-    }
 }
 
+// The Samsung Health Data SDK is proprietary and is not part of this repository.
+// Apps that use Samsung Health add the AAR they download from Samsung; the SDK only
+// compiles against it. Maintainers can put the real AAR in samsung-sdk/ (git-ignored)
+// to build and test against it; otherwise :samsung-health-stub is used.
+val samsungSdkAar = rootProject.file("samsung-sdk")
+    .listFiles { file -> file.extension == "aar" }
+    ?.firstOrNull()
+
 dependencies {
-    // Samsung Health Data SDK
-    implementation("com.samsung.android.health:data:1.0.0")
+    // Samsung Health Data SDK (compile-only, supplied by the app at runtime)
+    if (samsungSdkAar != null) {
+        compileOnly(files(samsungSdkAar))
+        testImplementation(files(samsungSdkAar))
+    } else {
+        compileOnly(project(":samsung-health-stub"))
+        testImplementation(project(":samsung-health-stub"))
+    }
 
     // Health Connect
     implementation("androidx.health.connect:connect-client:1.1.0")
@@ -101,16 +112,14 @@ afterEvaluate {
     }
 }
 
-tasks.register<Copy>("installSamsungSdkToMavenLocal") {
-    from("${project.projectDir}/libs/maven/com/samsung/android/health/data")
-    into("${System.getProperty("user.home")}/.m2/repository/com/samsung/android/health/data")
+// The stub has no Samsung behavior to test, so this test only builds against the real AAR.
+if (samsungSdkAar == null) {
+    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>()
+        .matching { it.name.contains("UnitTest") }
+        .configureEach { exclude("**/SamsungActiveEnergyAggregateTest.kt") }
 }
 
-tasks.matching { it.name.contains("PublicationToMavenLocal") }.configureEach {
-    dependsOn("installSamsungSdkToMavenLocal")
-}
-
-// Publish SDK + Samsung dependency to the Flutter plugin's bundled repo
+// Publish the SDK to the Flutter plugin's bundled repo
 val flutterRepoDir = providers.gradleProperty("flutterPluginRepo").orNull
 
 if (flutterRepoDir != null) {
@@ -122,15 +131,6 @@ if (flutterRepoDir != null) {
                     url = uri(flutterRepoDir)
                 }
             }
-        }
-
-        tasks.register<Copy>("installSamsungSdkToFlutterPlugin") {
-            from("${project.projectDir}/libs/maven/com/samsung/android/health/data")
-            into("$flutterRepoDir/com/samsung/android/health/data")
-        }
-
-        tasks.matching { it.name.contains("PublicationToFlutterPlugin") }.configureEach {
-            dependsOn("installSamsungSdkToFlutterPlugin")
         }
     }
 }

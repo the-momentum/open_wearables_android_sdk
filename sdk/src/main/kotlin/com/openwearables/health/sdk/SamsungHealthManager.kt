@@ -116,6 +116,7 @@ class SamsungHealthManager(
     override fun getTrackedTypes(): Set<String> = trackedTypeIds
 
     override fun isAvailable(): Boolean {
+        if (!SamsungHealthSdk.isPresent) return false
         return try {
             val packageInfo = context.packageManager.getPackageInfo(SAMSUNG_HEALTH_PACKAGE, 0)
             @Suppress("DEPRECATION")
@@ -133,6 +134,9 @@ class SamsungHealthManager(
      * Returns detailed availability info with error reporting via [Outcome].
      */
     fun isAvailableDetailed(): Outcome<Boolean> {
+        if (!SamsungHealthSdk.isPresent) {
+            return Outcome.Error(IllegalStateException(SamsungHealthSdk.MISSING_MESSAGE), "Samsung Health Data SDK not found")
+        }
         return try {
             val packageInfo = context.packageManager.getPackageInfo(SAMSUNG_HEALTH_PACKAGE, 0)
             @Suppress("DEPRECATION")
@@ -166,6 +170,10 @@ class SamsungHealthManager(
             true
         } catch (e: Exception) {
             logger("Failed to connect to Samsung Health: ${e.message}")
+            false
+        } catch (e: LinkageError) {
+            // The app's Samsung Health Data SDK does not match the API this SDK was built against.
+            logger("Failed to connect to Samsung Health: ${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }

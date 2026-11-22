@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "open-wearables-android-sdk"
 include(":sdk")
+include(":samsung-health-stub")
