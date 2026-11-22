@@ -34,8 +34,6 @@ class SecureStorage(private val context: Context) {
         private const val KEY_HEALTH_PROVIDER = "healthProvider"
         private const val KEY_APP_INSTALLED = "appInstalled"
         private const val KEY_SYNC_DAYS_BACK = "syncDaysBack"
-        private const val KEY_NOTIFICATION_TITLE = "notificationTitle"
-        private const val KEY_NOTIFICATION_TEXT = "notificationText"
     }
 
     /**
@@ -235,22 +233,6 @@ class SecureStorage(private val context: Context) {
     }
 
     fun getProvider(): String? = configPrefs.getString(KEY_HEALTH_PROVIDER, null)
-
-    // MARK: - Notification
-
-    fun saveNotificationTitle(title: String) {
-        configPrefs.edit().putString(KEY_NOTIFICATION_TITLE, title).apply()
-    }
-
-    fun saveNotificationText(text: String) {
-        configPrefs.edit().putString(KEY_NOTIFICATION_TEXT, text).apply()
-    }
-
-    fun getNotificationTitle(): String = configPrefs.getString(KEY_NOTIFICATION_TITLE, null)
-        ?: NotificationConfig.CHANNEL_NAME
-
-    fun getNotificationText(): String = configPrefs.getString(KEY_NOTIFICATION_TEXT, null)
-        ?: NotificationConfig.DEFAULT_TEXT
 
     // MARK: - API Base URL (derived from host)
 
